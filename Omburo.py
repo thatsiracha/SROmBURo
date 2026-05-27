@@ -6,6 +6,7 @@ id_wheel = 2
 id_roller = 1
 
 kt = 0.35
+iq = 1.5
 
 class Omburo:
 
@@ -24,6 +25,8 @@ class Omburo:
         self.bear.set_i_gain_iq((id_wheel, 0.061),(id_roller, 0.061))
         self.bear.set_d_gain_iq((id_wheel, 0.0),(id_roller, 0.0))
 
+        self.bear.set_limit_i_max((id_wheel, 1.5),(id_roller, 1.5))
+
     def getError(self):
         return (self.bear.ping(id_wheel)[0][1] and self.bear.ping(id_roller)[0][1])
 
@@ -40,10 +43,10 @@ class Omburo:
 
     def readback(self):
         # Read back the current position and velocity of the motors
-        position_wheel = self.bear.get_present_position(id_wheel)
-        velocity_wheel = self.bear.get_present_velocity(id_wheel)
-        position_roller = self.bear.get_present_position(id_roller)
-        velocity_roller = self.bear.get_present_velocity(id_roller)
+        position_wheel = self.bear.get_present_position(id_wheel)[0][0][0]
+        velocity_wheel = self.bear.get_present_velocity(id_wheel)[0][0][0]
+        position_roller = self.bear.get_present_position(id_roller)[0][0][0]
+        velocity_roller = self.bear.get_present_velocity(id_roller)[0][0][0]
 
         return (position_wheel, velocity_wheel, position_roller, velocity_roller)
 

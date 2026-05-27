@@ -7,6 +7,11 @@ omburo = Omburo()
 print("Starting Omburo test sequence...")
 print("=" * 60)
 
+BEAR_connected = Omburo.getError()
+if not BEAR_connected:
+    print("Error: Unable to connect to BEAR. Please check connections and try again.")
+    exit(1)
+
 # Enable torque
 print("Enabling torque...")
 omburo.toggleTorque(1)

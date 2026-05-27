@@ -21,7 +21,12 @@ omburo.setTorque(0.1, 0.1)
 
 start_time = time.time()
 while time.time() - start_time < 5.0:
-    position_wheel, velocity_wheel, position_roller, velocity_roller = omburo.readback()
+    pos_wheel, vel_wheel, pos_roller, vel_roller = omburo.readback()
+    # Extract scalar values if results are lists
+    position_wheel = pos_wheel[0] if isinstance(pos_wheel, list) else pos_wheel
+    velocity_wheel = vel_wheel[0] if isinstance(vel_wheel, list) else vel_wheel
+    position_roller = pos_roller[0] if isinstance(pos_roller, list) else pos_roller
+    velocity_roller = vel_roller[0] if isinstance(vel_roller, list) else vel_roller
     elapsed = time.time() - start_time
     print(f"[{elapsed:.2f}s] Wheel - Pos: {position_wheel:.4f}, Vel: {velocity_wheel:.4f} | "
           f"Roller - Pos: {position_roller:.4f}, Vel: {velocity_roller:.4f}")

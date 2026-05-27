@@ -22,7 +22,8 @@ print("Applying 0.1 N-m torque for 5 seconds...")
 print("Reading joint position and velocity:")
 print("-" * 60)
 
-omburo.setTorque(0.1, 0.1)
+# omburo.setTorque(0.1, 0.1)
+omburo.setVelocity(0.5, 0.5)  # Set a moderate velocity for testing
 
 start_time = time.time()
 while time.time() - start_time < 5.0:

@@ -14,8 +14,8 @@ class Omburo:
         
         self.bear = Manager.BEAR(port="/dev/ttyUSB0", baudrate=8000000)
 
-        # Set both motors to torque control mode
-        self.bear.set_mode((id_wheel, 0),(id_roller,0))
+        # Set both motors to velocity control mode
+        self.bear.set_mode((id_wheel, 1),(id_roller,1))
 
         # Configure motor PID
         self.bear.set_p_gain_iq((id_wheel, 0.277),(id_roller, 0.277))
@@ -40,6 +40,9 @@ class Omburo:
         iq_wheel = torque_wheel / kt
         iq_roller = torque_roller / kt
         self.bear.set_goal_iq((id_wheel, iq_wheel),(id_roller, iq_roller))
+
+    def setVelocity(self, vel_wheel, vel_roller):
+        self.bear.set_goal_velocity((id_wheel, vel_wheel),(id_roller, vel_roller))
 
     def readback(self):
         # Read back the current position and velocity of the motors

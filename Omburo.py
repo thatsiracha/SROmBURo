@@ -24,7 +24,9 @@ class Omburo:
         self.bear.set_i_gain_iq((id_wheel, 0.061),(id_roller, 0.061))
         self.bear.set_d_gain_iq((id_wheel, 0.0),(id_roller, 0.0))
 
-        
+    def getError(self):
+        return (self.bear.ping(id_wheel)[0][1] and self.bear.ping(id_roller)[0][1])
+
     def toggleTorque(self, val):
         '''
         val: 1 = ON / 0 = OFF

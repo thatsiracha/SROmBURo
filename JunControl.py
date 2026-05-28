@@ -69,10 +69,10 @@ MU2  = 0.5e-2     # roller axle
 # IMU euler tuple = (roll_deg, pitch_deg, yaw_deg)
 # IMU gyro  tuple = (ωx, ωy, ωz) rad/s
 # Adjust indices / signs for your physical mounting orientation.
-THETA1_EU_IDX    = 1;  THETA1_EU_SIGN    = 1.0   # pitch → θ1 (longitudinal)
-THETA2_EU_IDX    = 0;  THETA2_EU_SIGN    = -1.0   # roll  → θ2 (lateral)
-DTHETA1_GY_IDX   = 1;  DTHETA1_GY_SIGN   = 1.0   # ωy    → θ̇1
-DTHETA2_GY_IDX   = 0;  DTHETA2_GY_SIGN   = -1.0   # ωx    → θ̇2
+THETA1_EU_IDX    = 1;  THETA1_EU_SIGN    = -1.0   # pitch → θ1 (longitudinal)
+THETA2_EU_IDX    = 1;  THETA2_EU_SIGN    = 1.0   # roll  → θ2 (lateral)
+DTHETA1_GY_IDX   = 1;  DTHETA1_GY_SIGN   = -1.0   # ωy    → θ̇1
+DTHETA2_GY_IDX   = 1;  DTHETA2_GY_SIGN   = 1.0   # ωx    → θ̇2
 
 # ── Safety & timing ───────────────────────────────────────────────────────────
 FALL_DEG     = 30.0    # body angle threshold triggering fall-stop [deg]

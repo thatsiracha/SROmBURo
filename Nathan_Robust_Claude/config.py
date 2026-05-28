@@ -54,7 +54,7 @@ B_NOMINAL = np.array([
 ])
 
 # ── PID outer loop gains ────────────────────────────────────────────────────────
-PID_KP = 1.2
+PID_KP = 1000 #1.2
 PID_KI = 0.20
 PID_KD = 0.05
 INTEGRATOR_CLAMP = 5.0   # rad/s·s — anti-windup

@@ -1,5 +1,5 @@
 import numpy as np
-from SROmBURo.Nathan_Robust_Claude.config import (
+from config import (
     BODY_MASS, BODY_HEIGHT, BODY_LENGTH, I_BEND, I_SPIN,
     GRAVITY, WHEEL_RADIUS, ROLLER_EFF_RADIUS
 )

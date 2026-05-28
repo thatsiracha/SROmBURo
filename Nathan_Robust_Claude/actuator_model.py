@@ -1,5 +1,5 @@
 import numpy as np
-from SROmBURo.Nathan_Robust_Claude.config import MAX_TORQUE, MAX_TORQUE_RATE, DT
+from config import MAX_TORQUE, MAX_TORQUE_RATE, DT
 
 class ActuatorModel:
     """

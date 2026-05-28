@@ -1,6 +1,6 @@
 import numpy as np
-from SROmBURo.Nathan_Robust_Claude.Omburo import Omburo
-from SROmBURo.Nathan_Robust_Claude.actuator_model import ActuatorModel
+from Omburo import Omburo
+from actuator_model import ActuatorModel
 
 class MotorInterface:
     """

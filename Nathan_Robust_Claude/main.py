@@ -8,14 +8,14 @@ import signal
 import sys
 import numpy as np
 
-from SROmBURo.Nathan_Robust_Claude.config             import DT, WHEEL_RADIUS, ROLLER_EFF_RADIUS
-from SROmBURo.Nathan_Robust_Claude.microstrain_imu    import MicrostrainIMU
-from SROmBURo.Nathan_Robust_Claude.state_estimator    import StateEstimator
-from SROmBURo.Nathan_Robust_Claude.pid_controller     import PIDController
-from SROmBURo.Nathan_Robust_Claude.inverse_dynamics   import InverseDynamics
-from SROmBURo.Nathan_Robust_Claude.robustness_term    import RobustnessTerm
-from SROmBURo.Nathan_Robust_Claude.actuator_model     import ActuatorModel
-from SROmBURo.Nathan_Robust_Claude.motor_interface    import MotorInterface
+from config             import DT, WHEEL_RADIUS, ROLLER_EFF_RADIUS
+from microstrain_imu    import MicrostrainIMU
+from state_estimator    import StateEstimator
+from pid_controller     import PIDController
+from inverse_dynamics   import InverseDynamics
+from robustness_term    import RobustnessTerm
+from actuator_model     import ActuatorModel
+from motor_interface    import MotorInterface
 
 # ── Hardware ───────────────────────────────────────────────────────────────────
 imu    = MicrostrainIMU(port="/dev/ttyACM0", sample_rate_hz=200, background=True)

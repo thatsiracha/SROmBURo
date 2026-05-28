@@ -1,5 +1,5 @@
 import numpy as np
-from SROmBURo.Nathan_Robust_Claude.config import PID_KP, PID_KI, PID_KD, INTEGRATOR_CLAMP, DT
+from config import PID_KP, PID_KI, PID_KD, INTEGRATOR_CLAMP, DT
 
 class PIDController:
     """

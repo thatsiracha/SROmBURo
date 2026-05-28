@@ -1,6 +1,6 @@
 # state_estimator.py  (updated)
 import numpy as np
-from SROmBURo.Nathan_Robust_Claude.microstrain_imu import MicrostrainIMU, IMUReading
+from microstrain_imu import MicrostrainIMU, IMUReading
 
 class StateEstimator:
     """

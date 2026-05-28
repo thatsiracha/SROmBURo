@@ -1,5 +1,5 @@
 import numpy as np
-from SROmBURo.Nathan_Robust_Claude.config import RHO
+from config import RHO
 
 class RobustnessTerm:
     """

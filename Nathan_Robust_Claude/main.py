@@ -19,8 +19,8 @@ from motor_interface  import MotorInterface
 
 # ── Debug flags — set False to silence once everything works ───────────────────
 DEBUG_IMU    = True   # print IMU readings every tick
-DEBUG_MOTORS = True   # print motor torque commands every tick
-DEBUG_STATE  = True   # print estimated state every tick
+DEBUG_MOTORS = False  # print motor torque commands every tick
+DEBUG_STATE  = False   # print estimated state every tick
 PRINT_EVERY  = 40     # only print every N ticks (200 Hz -> ~5 Hz printout)
 
 # ── Hardware ───────────────────────────────────────────────────────────────────

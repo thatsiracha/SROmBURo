@@ -54,4 +54,4 @@ class Omburo:
         return (position_wheel, velocity_wheel, position_roller, velocity_roller)
 
     def close(self):
-        self.bear.close()
+        self.bear.disconnect()

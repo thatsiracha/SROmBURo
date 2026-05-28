@@ -16,6 +16,7 @@ class MotorInterface:
 
     def mix_and_send(self, u: np.ndarray) -> tuple[float, float]:
         """u = [u_long, u_lat] total torque command."""
+        self.robot.toggleTorque(1)
         cmd_wheel  = (u[0] + u[1]) / 2.0
         cmd_roller = (u[0] - u[1]) / 2.0
         tau = self.actuator.apply(np.array([cmd_wheel, cmd_roller]))

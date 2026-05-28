@@ -19,6 +19,7 @@ from config          import DT, WHEEL_RADIUS, ROLLER_EFF_RADIUS
 from microstrain_imu import MicrostrainIMU
 from state_estimator import StateEstimator
 from motor_interface import MotorInterface
+from Omburo import Omburo
 
 # ── Gains — TUNE THESE ────────────────────────────────────────────────────────
 # Direct tilt PD (output in Nm, applied directly to motors)
@@ -98,6 +99,7 @@ print(f"[Main] Resting tilt: theta_l={avg_tl:+.2f}°  theta_lat={avg_tlat:+.2f}�
 if abs(avg_tl) > 20 or abs(avg_tlat) > 20:
     print("[Main] WARNING: tilt > 20° — is the robot upright?")
 
+Omburo().toggleTorque(1)  # pre-enable torque so first command isn't delayed by wakeup
 time.sleep(0.2)
 
 print(f"""
@@ -113,6 +115,8 @@ def apply_deadband(val, db):
     return val - np.sign(val) * db
 
 # ── 200 Hz loop ───────────────────────────────────────────────────────────────
+
+
 while True:
     t0 = time.perf_counter()
     tick += 1

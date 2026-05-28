@@ -16,11 +16,12 @@ from inverse_dynamics import InverseDynamics
 from robustness_term  import RobustnessTerm
 from actuator_model   import ActuatorModel
 from motor_interface  import MotorInterface
+from Omburo import Omburo
 
 # ── Debug flags — set False to silence once everything works ───────────────────
 DEBUG_IMU    = True   # print IMU readings every tick
 DEBUG_MOTORS = False  # print motor torque commands every tick
-DEBUG_STATE  = False   # print estimated state every tick
+DEBUG_STATE  = True   # print estimated state every tick
 PRINT_EVERY  = 40     # only print every N ticks (200 Hz -> ~5 Hz printout)
 
 # ── Hardware ───────────────────────────────────────────────────────────────────
@@ -42,6 +43,7 @@ def shutdown(sig=None, frame=None):
     time.sleep(0.05)
     imu.disconnect()
     motors.shutdown()
+    Omburo().close()  # ensure clean disconnect in case of error
     sys.exit(0)
 
 signal.signal(signal.SIGINT,  shutdown)

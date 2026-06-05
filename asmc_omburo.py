@@ -5,7 +5,7 @@ import serial
 import time
 import math
 import imu_read  # This imports your unmodified IMU script
-import Omburo
+from Omburo import Omburo  
 
 class IMU_Bridge:
     def __init__(self, port="/dev/ttyACM0", baudrate=115200):

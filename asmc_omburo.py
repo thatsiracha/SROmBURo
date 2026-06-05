@@ -1,13 +1,77 @@
 import time
 import math
+import threading
+import serial
+import time
+import math
+import imu_read  # This imports your unmodified IMU script
+import Omburo
 
+class IMU_Bridge:
+    def __init__(self, port="/dev/ttyACM0", baudrate=115200):
+        self.theta = 0.0
+        self.theta_dot = 0.0
+        self.running = True
+        
+        print(f"Initializing IMU Bridge on {port}...")
+        self.ser = serial.Serial(port, baudrate, timeout=0.05, dsrdtr=False, rtscts=False)
+        time.sleep(1.5)
+        self.ser.reset_input_buffer()
+        
+        # Ping the device using your script's function
+        if not imu_read.send_and_ack(self.ser, imu_read.cmd_ping(), 0x01, "Ping"):
+            raise RuntimeError("IMU failed to respond to Ping.")
+
+        # Request Accel, Gyro, and Euler fields
+        fields = [imu_read.FIELD_ACCEL, imu_read.FIELD_GYRO, imu_read.FIELD_EULER]
+        
+        # NOTE: I bumped the sample rate to 500 Hz here to match your ASMC control loop speed!
+        imu_read.send_and_ack(self.ser, imu_read.cmd_set_imu_format(500, fields), 0x08, "IMU format")
+        imu_read.send_and_ack(self.ser, imu_read.cmd_enable_imu_stream(True), 0x11, "Start stream")
+        
+        # Start the background polling thread
+        self.thread = threading.Thread(target=self._poll_imu_stream, daemon=True)
+        self.thread.start()
+        print("IMU background thread actively buffering data.")
+
+    def _poll_imu_stream(self):
+        """ Runs continuously in the background parsing serial packets. """
+        while self.running:
+            pkt = imu_read.read_packet(self.ser, timeout=0.1)
+            if pkt:
+                desc_set, payload = pkt
+                if desc_set == imu_read.DESC_IMU:
+                    data = imu_read.parse_imu_packet(payload)
+                    
+                    # 1. Extract Pitch (theta)
+                    # Your script parses Euler to degrees. The ASMC math requires radians.
+                    if "euler_deg" in data:
+                        roll, pitch, yaw = data["euler_deg"]
+                        self.theta = math.radians(pitch) 
+                        
+                    # 2. Extract Pitch Velocity (theta_dot)
+                    # Gyro is already in rad/s. 
+                    # *Important:* You may need to change 'gy' to 'gx' depending on 
+                    # which way the IMU is physically mounted on your robot.
+                    if "gyro_rads" in data:
+                        gx, gy, gz = data["gyro_rads"]
+                        self.theta_dot = gy  
+
+    def read_imu(self):
+        """ Instant, non-blocking fetch of the latest state for the ASMC loop. """
+        return self.theta, self.theta_dot
+
+    def close(self):
+        """ Safely shuts down the stream and serial port. """
+        self.running = False
+        self.ser.write(imu_read.cmd_enable_imu_stream(False))
+        self.ser.close()
+        self.thread.join()
+        
 # ==============================================================================
 # HARDWARE INTERFACE PLACEHOLDERS (TODO: Replace with your actual libraries)
 # ==============================================================================
-def read_imu():
-    """ Read pitch angle (theta) and pitch velocity (theta_dot) from IMU in radians. """
-    # Example: return mpu6050.get_pitch(), mpu6050.get_pitch_velocity()
-    return 0.0, 0.0 
+
 
 def send_torque_to_bear_motor(torque_nm):
     """ Send torque command via CAN to Bear motor drivers. """
@@ -75,31 +139,52 @@ class ASMC_Balancer:
 # ==============================================================================
 def main():
     print("Starting OmBURo ASMC Balancing Loop...")
-    controller = ASMC_Balancer()
     
-    target_dt = 0.002 # 500 Hz control loop
+    # 1. Initialize the threaded IMU Bridge
+    imu = IMU_Bridge(port="/dev/ttyACM0")
+    robot = Omburo()
+    
+    # Enable power to the motor coils
+    robot.toggleTorque(1)
+
+    # 2. Initialize the Controller
+    controller = ASMC_Balancer()
+    target_dt = 0.002 # 500 Hz
     
     try:
         while True:
             start_time = time.perf_counter()
             
-            # 1. Read Sensors
-            theta, theta_dot = read_imu()
+            # --- Non-blocking fetch of latest IMU state ---
+            theta, theta_dot = imu.read_imu()
             
-            # 2. Compute Control Law
+            # Compute Control Law
             torque, current_K, s = controller.compute_torque(theta, theta_dot, target_dt)
             
-            # 3. Actuate
-            send_torque_to_bear_motor(torque)
+            # --- C. Actuate ---
+            # We are testing the main wheel first. 
+            # Send the calculated torque to the wheel, and 0.0 to the roller.
+            robot.setTorque(torque_wheel=torque, torque_roller=0.0)
             
-            # 4. Enforce Real-Time Loop Timing (Wait until 2ms has passed)
+            # --- D. Enforce Loop Timing ---
             elapsed = time.perf_counter() - start_time
             if elapsed < target_dt:
                 time.sleep(target_dt - elapsed)
                 
     except KeyboardInterrupt:
-        print("Safely shutting down motors...")
-        send_torque_to_bear_motor(0.0)
+        print("\nCtrl+C detected. Safely shutting down hardware...")
+        
+        # 1. Command zero torque immediately
+        robot.setTorque(0.0, 0.0)
+        
+        # 2. Disable motor coils to prevent runaway
+        robot.toggleTorque(0)
+        
+        # 3. Close serial ports
+        robot.close()
+        imu.close()
+        
+        print("Shutdown complete.")
 
 if __name__ == "__main__":
     main()

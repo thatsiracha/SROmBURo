@@ -14,8 +14,8 @@ class Omburo:
         
         self.bear = Manager.BEAR(port="/dev/ttyUSB0", baudrate=8000000)
 
-        # Set both motors to velocity control mode
-        self.bear.set_mode((id_wheel, 1),(id_roller,1))
+        # Set both motors to torque control mode
+        self.bear.set_mode((id_wheel, 0),(id_roller, 0))
 
         # Configure motor PID
         self.bear.set_p_gain_iq((id_wheel, 0.277),(id_roller, 0.277))

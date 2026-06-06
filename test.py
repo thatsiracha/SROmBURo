@@ -17,13 +17,14 @@ print("Enabling torque...")
 omburo.toggleTorque(1)
 time.sleep(0.5)
 
-# Apply 0.1 N-m torque for 5 seconds
-print("Applying 0.1 N-m torque for 5 seconds...")
+# Apply velocity for 5 seconds
+print("Applying velocity for 5 seconds...")
 print("Reading joint position and velocity:")
 print("-" * 60)
 
+omburo.setVelocityMode()
 # omburo.setTorque(0.1, 0.1)
-omburo.setVelocity(0.5, 0.5)  # Set a moderate velocity for testing
+omburo.setVelocity(2.0, -2.5)  # Set a moderate velocity for testing
 
 start_time = time.time()
 while time.time() - start_time < 5.0:
@@ -41,6 +42,8 @@ while time.time() - start_time < 5.0:
 # Disable torque
 print("-" * 60)
 print("Disabling torque...")
+omburo.setVelocity(0.0, 0.0)
+omburo.setTorqueMode()
 omburo.toggleTorque(0)
 time.sleep(0.5)
 

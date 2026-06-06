@@ -50,7 +50,7 @@ import signal
 import sys
 import math
 import numpy as np
-from microstrain_imu import MicrostrainIMU, IMUReading
+from IMURead import MicrostrainIMU, IMUReading
 from Omburo import Omburo
 
 

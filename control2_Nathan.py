@@ -344,7 +344,7 @@ class Controller:
         motor2dot = vel_w
         motor1dot = vel_r
         phi_rolldot = motor2dot 
-        phi_pitchdot = motor2dot + motor1dot
+        phi_pitchdot = motor2dot - motor1dot
 
         # EMA low-pass filter
         a_ang  = EMA_ALPHA_ANG

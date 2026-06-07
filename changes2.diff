@@ -1,0 +1,55 @@
+diff --git a/Omburo.py b/Omburo.py
+index c8b9a95..64ac69c 100644
+--- a/Omburo.py // main
++++ b/Omburo.py // picode
+@@ -14,8 +14,9 @@ class Omburo:
+         
+         self.bear = Manager.BEAR(port="/dev/ttyUSB0", baudrate=8000000)
+ 
+-        # Set both motors to velocity control mode
+-        self.bear.set_mode((id_wheel, 1),(id_roller,1))
++        # Set both motors to torque/current control mode.
++        # PyBEAR examples use mode 1=velocity, 2=position, 3=torque/current.
++        self.bear.set_mode((id_wheel, 0),(id_roller, 0))
+ 
+         # Configure motor PID
+         self.bear.set_p_gain_iq((id_wheel, 0.277),(id_roller, 0.277))
+@@ -25,7 +26,7 @@ class Omburo:
+         self.bear.set_i_gain_iq((id_wheel, 0.061),(id_roller, 0.061))
+         self.bear.set_d_gain_iq((id_wheel, 0.0),(id_roller, 0.0))
+ 
+-        self.bear.set_limit_i_max((id_wheel, 1.5),(id_roller, 1.5))
++        self.bear.set_limit_i_max((id_wheel, 6.0),(id_roller, 6.0))
+ 
+     def getError(self):
+         return (self.bear.ping(id_wheel)[0][1] and self.bear.ping(id_roller)[0][1])
+@@ -41,17 +42,26 @@ class Omburo:
+         iq_roller = torque_roller / kt
+         self.bear.set_goal_iq((id_wheel, iq_wheel),(id_roller, iq_roller))
+ 
++    def setCurrentLimit(self, iq_max):
++        self.bear.set_limit_i_max((id_wheel, iq_max),(id_roller, iq_max))
++
++    def setVelocityMode(self):
++        self.bear.set_mode((id_wheel, 1),(id_roller, 1))
++
++    def setTorqueMode(self):
++        self.bear.set_mode((id_wheel, 3),(id_roller, 3))
++
+     def setVelocity(self, vel_wheel, vel_roller):
+         self.bear.set_goal_velocity((id_wheel, vel_wheel),(id_roller, vel_roller))
+ 
+     def readback(self):
+         # Read back the current position and velocity of the motors
+         position_wheel = self.bear.get_present_position(id_wheel)[0][0][0]
+-        velocity_wheel = self.bear.get_present_velocity(id_wheel)[0][0][0]
++        velocity_wheel = -self.bear.get_present_velocity(id_wheel)[0][0][0]
+         position_roller = self.bear.get_present_position(id_roller)[0][0][0]
+         velocity_roller = self.bear.get_present_velocity(id_roller)[0][0][0]
+ 
+         return (position_wheel, velocity_wheel, position_roller, velocity_roller)
+ 
+     def close(self):
+-        self.bear.close()
+\ No newline at end of file
++        self.bear.close_port()

@@ -376,13 +376,13 @@ class Controller:
 
         # Axis 1, roll: OmburoRev2 f1_goal.
         roll_cmd = K11 * roll + K12 * rolldot + K13 * phi_rolldot + K14 * self._phi_roll_pos + KI_ROLL * self._roll_int
-        roll_cmd_op = -roll_cmd
+        roll_cmd_op = roll_cmd
         # Axis 2, pitch: OmburoRev2 f2_goal. The roller coupling scale belongs here.
-        pitch_cmd = (K21 * pitch + K22 * pitchdot  + K24 * self._phi_pitch_pos + KI_PITCH * self._pitch_int) * N_ROLLER - (K23 * phi_pitchdot)
+        pitch_cmd = -(K21 * pitch + K22 * pitchdot  + K24 * self._phi_pitch_pos + KI_PITCH * self._pitch_int) * N_ROLLER - (K23 * phi_pitchdot)
 
         # BEAR wiring mapping: id2 = roll_cmd, id1 = pitch_cmd - roll_cmd.
         motor2_cmd = float(np.clip(roll_cmd_op, -VEL_MAX, VEL_MAX))
-        motor1_cmd = float(np.clip(pitch_cmd - roll_cmd, -VEL_MAX, VEL_MAX))
+        motor1_cmd = float(np.clip(pitch_cmd + roll_cmd, -VEL_MAX, VEL_MAX))
         self.robot.setVelocity(motor2_cmd, motor1_cmd)
         self._last_vw = motor2_cmd
         self._last_vr = motor1_cmd

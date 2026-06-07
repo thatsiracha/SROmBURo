@@ -68,15 +68,6 @@ class IMU_Bridge:
         self.ser.close()
         self.thread.join()
         
-# ==============================================================================
-# HARDWARE INTERFACE PLACEHOLDERS (TODO: Replace with your actual libraries)
-# ==============================================================================
-
-
-def send_torque_to_bear_motor(torque_nm):
-    """ Send torque command via CAN to Bear motor drivers. """
-    # Example: can_bus.send(ID, torque_nm)
-    pass
 
 # ==============================================================================
 # ADAPTIVE SLIDING MODE CONTROLLER CLASS
@@ -88,7 +79,7 @@ class ASMC_Balancer:
         # ---------------------------------------------------------
         # These are the a21, a22, and b21 terms from your A and B matrices.
         # They don't need to be perfect; the adaptive gain will fix errors.
-        self.a21 = 35.0  # Gravity tipping parameter (roughly g / length_to_COM)
+        self.a21 = 19.7  # Gravity tipping parameter (roughly g / length_to_COM)
         self.a22 = 0.5   # Baseline mechanical damping/friction
         self.b21 = 2.5   # Control authority (roughly 1 / Total_Inertia)
 

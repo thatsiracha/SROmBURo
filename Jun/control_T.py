@@ -2,25 +2,22 @@
 SrOmBURo PID Torque Controller — Raspberry Pi
 Uses: MicrostrainIMU (microstrain_imu.py) + Omburo (Omburo.py)
 
-Naming convention matches the OmBURo paper (Shen & Hong, arXiv:2001.07856):
-    roll  (θ₁) — longitudinal tilt, forward/backward — motor id2 (wheel)
-    pitch (θ₂) — lateral tilt,      side-to-side      — motor id1 (roller)
-
-Note: this is the OPPOSITE of standard robotics convention but matches
-the paper. The previous code had these swapped.
+Axis and motor direction convention follows control2_Suraj.py:
+    roll  — lateral tilt,      euler[0], sign +1
+    pitch — longitudinal tilt, euler[1], sign -1
 
 Control law per axis:
     error    = 0 − angle                          (want upright = 0 rad)
     integral += error · dt                        (anti-windup clamped)
     torque   = Kp·error + Ki·integral + Kd·rate + Kv·wheel_velocity
 
-Motor mixing (from paper §IV, BEAR wiring):
-    motor id2 torque = roll_torque
-    motor id1 torque = roll_torque − pitch_torque
+Motor output, matching control2_Suraj.py:
+    motor id2 torque = pitch_torque
+    motor id1 torque = roll_torque
 
 Tuning order:
-    1. KP_ROLL = 10, KD_ROLL = 0.2, KI_ROLL = 0  — get longitudinal balance
-    2. KP_PITCH = 10, KD_PITCH = 0.2, KI_PITCH = 0 — get lateral balance
+    1. KP_ROLL = 10, KD_ROLL = 0.2, KI_ROLL = 0  — get lateral balance
+    2. KP_PITCH = 10, KD_PITCH = 0.2, KI_PITCH = 0 — get longitudinal balance
     3. Raise KP until it resists tipping, raise KD to kill oscillation
     4. Add KI (0.1–0.5) only once KP/KD are stable
     5. Add KV (0.2–1.0) to prevent runaway wheel spin
@@ -32,7 +29,6 @@ import sys
 import threading
 import time
 
-import numpy as np
 import serial
 from pybear import Manager
 
@@ -49,7 +45,7 @@ class Config:
     # Ports
     IMU_PORT    = "/dev/ttyACM0"
     IMU_BAUD    = 115200
-    IMU_RATE_HZ = 200          # IMU sample rate — must divide 500 evenly
+    IMU_RATE_HZ = 500          # IMU sample rate — synced 1:1 with control loop
 
     # Loop
     CTRL_HZ = 500
@@ -59,22 +55,20 @@ class Config:
     N_ROLLER = 4.0   # roller gear coupling (φ̇₂ = N·(φ̇_wheel + φ̇_roller))
 
     # ── IMU axis mapping ──────────────────────────────────────────────────────
-    # Paper convention (confirmed by hardware test):
-    #   roll  (longitudinal, θ₁) = euler[1], sign = -1
-    #   pitch (lateral,      θ₂) = euler[0], sign = +1
-    ROLL_EU_IDX   = 1;  ROLL_EU_SIGN   =  -1.0   # longitudinal — was PITCH
-    PITCH_EU_IDX  = 0;  PITCH_EU_SIGN  =  1.0   # lateral      — was ROLL
+    # Matches control2_Suraj.py: roll=euler[0](+), pitch=euler[1](-).
+    ROLL_EU_IDX   = 0;  ROLL_EU_SIGN   =  1.0   # roll  → lateral axis
+    PITCH_EU_IDX  = 1;  PITCH_EU_SIGN  = -1.0   # pitch → longitudinal axis
 
-    ROLLDOT_IDX   = 1;  ROLLDOT_SIGN   = -1.0   # ωy → θ̇₁ (longitudinal rate)
-    PITCHDOT_IDX  = 0;  PITCHDOT_SIGN  =  1.0   # ωx → θ̇₂ (lateral rate)
+    ROLLDOT_IDX   = 0;  ROLLDOT_SIGN   =  1.0   # ωx → roll rate
+    PITCHDOT_IDX  = 1;  PITCHDOT_SIGN  = -1.0   # ωy → pitch rate
 
-    # ── PID gains — ROLL axis (longitudinal, forward/backward) ───────────────
+    # ── PID gains — ROLL axis (lateral, side-to-side) ─────────────────────────
     KP_ROLL  = 30.0   # Nm/rad
     KI_ROLL  =  0.0   # Nm/(rad·s) — start at 0, add slowly
     KD_ROLL  =  0.5   # Nm·s/rad   (uses gyro directly, not finite diff)
     KV_ROLL  =  0.00   # Nm/(rad/s) — wheel velocity damping
 
-    # ── PID gains — PITCH axis (lateral, side-to-side) ───────────────────────
+    # ── PID gains — PITCH axis (longitudinal, forward/backward) ───────────────
     KP_PITCH = 30.0
     KI_PITCH =  0.0
     KD_PITCH =  0.5
@@ -100,11 +94,11 @@ class Config:
 
     # ── Feedforward Parameters (Gravity & Friction) ───────────────────────────
     # 물리 파라미터 — 실측치로 교체할 것
-    M_TOTAL   = 5.0    # [kg]
+    M_TOTAL   = 2.4    # [kg]
     G_ACCEL   = 9.81   # [m/s²]
-    L_COM     = 0.65   # [m] 무게중심 높이
-    R_WHEEL_ROLL  = 0.05   # [m] roll 축 유효 구동 반지름
-    R_WHEEL_PITCH = 0.04   # [m] pitch 축 유효 구동 반지름
+    L_COM     = 0.5   # [m] 무게중심 높이
+    R_WHEEL_ROLL  = 0.015  # [m] roll 축 유효 구동 반지름
+    R_WHEEL_PITCH = 0.1   # [m] pitch 축 유효 구동 반지름
 
     # 중력 토크 (모터 기준): MGL·sin(θ) / (1 + L/r)
     # leverage = 1 + L/r 로 나눠야 모터 출력 기준 실제값이 됨
@@ -118,7 +112,7 @@ class Config:
     FRIC_TANH_SCALE = 20.0   # 1/(rad/s)
 
     # ── Debug ─────────────────────────────────────────────────────────────────
-    PRINT_EVERY = 50   # print every N control ticks (~10 Hz at 500 Hz)
+    PRINT_EVERY = 500   # print every N control ticks (~1 Hz at 500 Hz)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -243,7 +237,9 @@ class IMUState:
 
     def get(self) -> tuple:
         with self._lock:
-            return self.euler, self.gyro
+            euler = self.euler
+            gyro = self.gyro
+        return euler, gyro
 
 
 def _imu_reader_thread(state: IMUState, cfg: Config):
@@ -323,11 +319,9 @@ class PIDTorque:
         p = self.kp * error
 
         # Integral with anti-windup
-        self._integral = float(np.clip(
-            self._integral + error * self.dt,
-            -self.int_cap / max(self.ki, 1e-9),
-            +self.int_cap / max(self.ki, 1e-9),
-        ))
+        int_limit = self.int_cap / max(self.ki, 1e-9)
+        self._integral = max(-int_limit, min(self._integral + error * self.dt,
+                                             int_limit))
         i = self.ki * self._integral
 
         # Derivative from gyro (low-pass filtered)
@@ -354,9 +348,9 @@ class OmBUROPIDController:
     """
     PID torque balancing controller for SrOmBURo.
 
-    Naming follows the paper:
-        roll  = longitudinal axis (forward/backward tilt, θ₁)
-        pitch = lateral axis      (side-to-side tilt,    θ₂)
+    Axis and motor direction convention follows control2_Suraj.py:
+        roll  = lateral axis
+        pitch = longitudinal axis
     """
 
     def __init__(self):
@@ -377,12 +371,12 @@ class OmBUROPIDController:
             int_cap=self.cfg.INT_CAP_PITCH, dt=self.cfg.CTRL_DT
         )
 
-        # EMA filter states — roll axis (longitudinal)
+        # EMA filter states — roll axis (lateral)
         self._roll_filt      = 0.0
         self._rolldot_filt   = 0.0
         self._vel_roll_filt  = 0.0   # motor id2 velocity
 
-        # EMA filter states — pitch axis (lateral)
+        # EMA filter states — pitch axis (longitudinal)
         self._pitch_filt     = 0.0
         self._pitchdot_filt  = 0.0
         self._vel_pitch_filt = 0.0   # motor id1+id2 velocity
@@ -403,7 +397,7 @@ class OmBUROPIDController:
         """Start IMU thread, calibrate, then enter 500 Hz control loop."""
         print("=" * 60)
         print("  SrOmBURo PID Torque Controller")
-        print("  Axes: roll=longitudinal(θ₁)  pitch=lateral(θ₂)")
+        print("  Axes: roll=lateral  pitch=longitudinal")
         print("=" * 60)
 
         # Start IMU background thread
@@ -526,7 +520,7 @@ class OmBUROPIDController:
         cfg = self.cfg
         euler, gyro = self.imu.get()
 
-        # ── 1. Sensor → body angles (paper convention) ──────────────────────
+        # ── 1. Sensor → body angles (control2_Suraj.py convention) ──────────
         roll  = (cfg.ROLL_EU_SIGN  * math.radians(euler[cfg.ROLL_EU_IDX])
                  - self._roll_offset)
         pitch = (cfg.PITCH_EU_SIGN * math.radians(euler[cfg.PITCH_EU_IDX])
@@ -554,11 +548,11 @@ class OmBUROPIDController:
             vel_w = self._last_vel_w
             vel_r = self._last_vel_r
 
-        # Motor wiring → axis velocities (paper §IV):
-        #   roll  axis velocity = motor id2 (wheel)
-        #   pitch axis velocity = motor id2 + motor id1 (roller coupling)
-        vel_roll_raw  = vel_w
-        vel_pitch_raw = vel_w + vel_r
+        # Motor wiring → axis velocities, matching control2_Suraj.py.
+        #   id1 roller    → roll axis
+        #   id2 big wheel → pitch axis
+        vel_roll_raw  = vel_r
+        vel_pitch_raw = vel_w
 
         # ── 4. EMA low-pass filters ───────────────────────────────────────────
         a_ang  = cfg.EMA_ANG
@@ -582,29 +576,30 @@ class OmBUROPIDController:
         # ── 5. PID + Feedforward 토크 계산 ───────────────────────────────────────
         # 5.1 Feedback (PID)
         tau_fb_roll  = self.pid_roll.compute(roll_f,  rolldot_f,  vel_roll_f)
-        tau_fb_pitch = -self.pid_pitch.compute(pitch_f, pitchdot_f, vel_pitch_f)
+        tau_fb_pitch = self.pid_pitch.compute(pitch_f, pitchdot_f, vel_pitch_f)
 
-        # 5.2 Gravity Feedforward: tau_motor = MGL·sin(θ) / (1 + L/r)
-        lev_roll  = 1.0 + cfg.L_COM / cfg.R_WHEEL_ROLL   # 예: 1 + 0.65/0.05 = 14
-        lev_pitch = 1.0 + cfg.L_COM / cfg.R_WHEEL_PITCH  # 예: 1 + 0.65/0.04 = 17.25
-        tau_ff_roll_g  = -cfg.MGL_TOTAL * math.sin(roll_f)  / lev_roll
-        tau_ff_pitch_g =  cfg.MGL_TOTAL * math.sin(pitch_f) / lev_pitch
+        # 5.2 Dynamic Gravity Feedforward: cos 성분을 실시간 반영
+        denom_roll  = 1.0 + (cfg.L_COM * math.cos(roll_f) / cfg.R_WHEEL_ROLL)
+        denom_pitch = 1.0 + (cfg.L_COM * math.cos(pitch_f) / cfg.R_WHEEL_PITCH)
+        tau_ff_roll_g  = -(cfg.MGL_TOTAL * math.sin(roll_f))  / denom_roll
+        tau_ff_pitch_g = -(cfg.MGL_TOTAL * math.sin(pitch_f)) / denom_pitch
 
         # 5.3 Friction Feedforward (tanh — sign 대신 연속 함수로 채터링 방지)
         tau_ff_roll_f  = -cfg.FRIC_ROLL  * math.tanh(rolldot_f  * cfg.FRIC_TANH_SCALE)
         tau_ff_pitch_f =  cfg.FRIC_PITCH * math.tanh(pitchdot_f * cfg.FRIC_TANH_SCALE)
 
-        # Total = Feedback + Feedforward
-        tau_roll  = tau_fb_roll  + tau_ff_roll_g  + tau_ff_roll_f
-        tau_pitch = tau_fb_pitch + tau_ff_pitch_g + tau_ff_pitch_f
+        # Total = Feedback + Feedforward.
+        # Roll is inverted to match control2_Suraj.py's positive roll_cmd direction.
+        tau_roll_total  = -(tau_fb_roll  + tau_ff_roll_g  + tau_ff_roll_f)
+        tau_pitch_total = tau_fb_pitch + tau_ff_pitch_g + tau_ff_pitch_f
 
-        # ── 6. Motor mixing (paper convention) ───────────────────────────────
-        tau_motor2 = tau_roll + (tau_pitch / cfg.N_ROLLER)
-        tau_motor1 = tau_pitch
+        # ── 6. Motor output, matching control2_Suraj.py ──────────────────────
+        tau_motor2 = tau_pitch_total
+        tau_motor1 = tau_roll_total
 
         # Saturate
-        tau_motor2 = float(np.clip(tau_motor2, -cfg.MAX_TORQUE, cfg.MAX_TORQUE))
-        tau_motor1 = float(np.clip(tau_motor1, -cfg.MAX_TORQUE, cfg.MAX_TORQUE))
+        tau_motor2 = max(-cfg.MAX_TORQUE, min(tau_motor2, cfg.MAX_TORQUE))
+        tau_motor1 = max(-cfg.MAX_TORQUE, min(tau_motor1, cfg.MAX_TORQUE))
 
         # Below noise floor → send zero (don't waste current on micro-commands)
         if abs(tau_motor2) < cfg.MIN_TORQUE: tau_motor2 = 0.0
@@ -615,18 +610,18 @@ class OmBUROPIDController:
         self.robot.setTorque(tau_motor2, tau_motor1)
         
 
-        # ── 8. Debug print (~10 Hz) ───────────────────────────────────────────
+        # ── 8. Debug print (~1 Hz) ────────────────────────────────────────────
         if tick % cfg.PRINT_EVERY == 0:
             print(
                 f"\n"
-                f"  ROLL  (long): angle={math.degrees(roll_f):+6.2f}°  "
+                f"  ROLL  (lat) : angle={math.degrees(roll_f):+6.2f}°  "
                 f"rate={math.degrees(rolldot_f):+6.2f}°/s  "
                 f"vel={vel_roll_f:+.3f} rad/s  "
-                f"τ_roll={tau_roll:+.4f} Nm\n"
-                f"  PITCH (lat) : angle={math.degrees(pitch_f):+6.2f}°  "
+                f"τ_roll={tau_roll_total:+.4f} Nm\n"
+                f"  PITCH (long): angle={math.degrees(pitch_f):+6.2f}°  "
                 f"rate={math.degrees(pitchdot_f):+6.2f}°/s  "
                 f"vel={vel_pitch_f:+.3f} rad/s  "
-                f"τ_pitch={tau_pitch:+.4f} Nm\n"
+                f"τ_pitch={tau_pitch_total:+.4f} Nm\n"
                 f"  MOTORS      : id2(wheel)={tau_motor2:+.4f} Nm  "
                 f"id1(roller)={tau_motor1:+.4f} Nm",
                 flush=True

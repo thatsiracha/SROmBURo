@@ -1,14 +1,12 @@
 """
-SrOmBURo balance controller — Sliding Mode or Linear MPC with direct force actuation.
+SrOmBURo balance controller — Sliding Mode Control with BEAR velocity actuation.
 
-Uses OmburoForce.py (BEAR mode 3) so the outer loop commands torque [Nm] and
-the firmware force PID tracks it via onboard sensing.
-
-Plant: inverted pendulum, 5 kg, 1.6 m, omni wheel (pitch + roll).
+Outer loop: SMC computes axis torque [Nm] from IMU state.
+Actuation: torque → wheel/roller velocity [rad/s] via OmburoVel (mode 1).
 
 Run:
     python3 mpc_control_s.py
-    python3 mpc_control_s.py --mode mpc
+    python3 mpc_control_s.py --lambda 10 --k-switch 4
 """
 
 from __future__ import annotations
@@ -20,17 +18,12 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Literal
 
 import numpy as np
 import serial
-from scipy.linalg import expm
-from scipy.optimize import minimize
 
 sys.path.insert(0, "/home/omburo/Documents/SROmBURo/Suraj")
-from OmburoForce import OmburoForce, kt, iq as IQ_HW_LIMIT
-
-CONTROLLER_MODE: Literal["smc", "mpc"] = "smc"
+from OmburoVel import OmburoVel
 
 IMU_PORT = "/dev/ttyACM0"
 IMU_BAUD = 115200
@@ -59,8 +52,8 @@ PHI_POS_SIGN_R = 1.0
 FALL_DEG = 40.0
 CTRL_HZ = 500
 CTRL_DT = 1.0 / CTRL_HZ
-I_TEST_A = 6.0
-TAU_MAX = kt * min(IQ_HW_LIMIT, I_TEST_A)
+VEL_MAX = 50.0          # motor velocity saturation [rad/s]
+TAU_TO_VEL = 8.0        # SMC torque [Nm] → velocity [rad/s]
 SOFTSTART_S = 0.5
 
 EMA_ALPHA_ANG = 0.25
@@ -71,10 +64,6 @@ SMC_LAMBDA = 12.0
 SMC_K_SWITCH = 8.0
 SMC_PHI = 0.08
 SMC_USE_WHEEL_STATE = False
-
-MPC_HORIZON = 12
-MPC_Q = np.diag([0.5, 200.0, 0.2, 4.0])
-MPC_R = np.array([[80.0]])
 
 
 def build_axis_model(gear_ratio: float = 1.0, motor_sign: float = 1.0):
@@ -95,24 +84,9 @@ def build_axis_model(gear_ratio: float = 1.0, motor_sign: float = 1.0):
     return A, B
 
 
-def c2d(A: np.ndarray, B: np.ndarray, dt: float):
-    n, m = A.shape[0], B.shape[1]
-    M_big = np.zeros((n + m, n + m))
-    M_big[:n, :n] = A
-    M_big[:n, n:] = B
-    Md = expm(M_big * dt)
-    return Md[:n, :n], Md[:n, n:]
-
-
 @dataclass
 class AxisPlant:
     name: str
-    gear_ratio: float
-    motor_sign: float
-    A: np.ndarray
-    B: np.ndarray
-    Ad: np.ndarray
-    Bd: np.ndarray
     a21: float
     a22: float
     b21: float
@@ -122,22 +96,21 @@ def _reduced_tilt_coeffs(A: np.ndarray, B: np.ndarray) -> tuple[float, float, fl
     return float(A[3, 1]), float(A[3, 3]), float(B[3, 0])
 
 
-def make_plants(dt: float) -> tuple[AxisPlant, AxisPlant]:
+def make_plants() -> tuple[AxisPlant, AxisPlant]:
     A_p, B_p = build_axis_model(gear_ratio=1.0, motor_sign=-1.0)
     A_r, B_r = build_axis_model(gear_ratio=N_ROLLER, motor_sign=1.0)
-    Ad_p, Bd_p = c2d(A_p, B_p, dt)
-    Ad_r, Bd_r = c2d(A_r, B_r, dt)
-    pitch = AxisPlant("pitch", 1.0, -1.0, A_p, B_p, Ad_p, Bd_p, *_reduced_tilt_coeffs(A_p, B_p))
-    roll = AxisPlant("roll", N_ROLLER, 1.0, A_r, B_r, Ad_r, Bd_r, *_reduced_tilt_coeffs(A_r, B_r))
+    pitch = AxisPlant("pitch", *_reduced_tilt_coeffs(A_p, B_p))
+    roll = AxisPlant("roll", *_reduced_tilt_coeffs(A_r, B_r))
     return pitch, roll
 
 
 class AxisSMC:
-    def __init__(self, plant: AxisPlant):
+    def __init__(self, plant: AxisPlant, tau_max: float):
         self.plant = plant
         self.lambda_s = SMC_LAMBDA
         self.k_sw = SMC_K_SWITCH
         self.phi = SMC_PHI
+        self.tau_max = tau_max
 
     def compute(self, theta: float, theta_dot: float, phi: float = 0.0, phi_dot: float = 0.0) -> float:
         p = self.plant
@@ -149,52 +122,7 @@ class AxisSMC:
         u = tau_eq + tau_sw
         if SMC_USE_WHEEL_STATE:
             u += -(0.05 * phi + 0.02 * phi_dot)
-        return float(np.clip(u, -TAU_MAX, TAU_MAX))
-
-
-class AxisMPC:
-    def __init__(self, plant: AxisPlant, horizon: int = MPC_HORIZON):
-        self.plant = plant
-        self.N = horizon
-        self.Q = MPC_Q
-        self.R = MPC_R
-        self._u_prev = 0.0
-        self._build_prediction_matrices()
-
-    def _build_prediction_matrices(self) -> None:
-        n, m = 4, 1
-        N = self.N
-        Ad, Bd = self.plant.Ad, self.plant.Bd
-        F = np.zeros((N * n, n))
-        G = np.zeros((N * n, N * m))
-        Apow = np.eye(n)
-        for k in range(N):
-            F[k * n:(k + 1) * n, :] = Apow @ Ad
-            Apow = Apow @ Ad
-            for j in range(k + 1):
-                G[k * n:(k + 1) * n, j:j + 1] = np.linalg.matrix_power(Ad, k - j) @ Bd
-        Q_bar = np.kron(np.eye(N), self.Q)
-        R_bar = np.kron(np.eye(N), self.R)
-        self.F, self.G = F, G
-        self.H = G.T @ Q_bar @ G + R_bar
-        self.f_coeff = G.T @ Q_bar @ F
-
-    def compute(self, x: np.ndarray) -> float:
-        x = x.reshape(4, 1)
-        f_vec = (self.f_coeff @ x).reshape(-1)
-
-        def cost(u_seq: np.ndarray) -> float:
-            u_col = u_seq.reshape(-1, 1)
-            pred = self.F @ x + self.G @ u_col
-            return float(pred.T @ np.kron(np.eye(self.N), self.Q) @ pred
-                           + u_col.T @ np.kron(np.eye(self.N), self.R) @ u_col)
-
-        bounds = [(-TAU_MAX, TAU_MAX)] * self.N
-        u0 = np.full(self.N, self._u_prev)
-        res = minimize(cost, u0, method="L-BFGS-B", bounds=bounds, options={"maxiter": 25, "ftol": 1e-6})
-        u_cmd = float(res.x[0]) if res.success else float(np.clip(self._u_prev, -TAU_MAX, TAU_MAX))
-        self._u_prev = u_cmd
-        return u_cmd
+        return float(np.clip(u, -self.tau_max, self.tau_max))
 
 
 # ── MIP IMU (same protocol as control2_Suraj.py) ──────────────────────────────
@@ -359,18 +287,12 @@ def _imu_thread(state: IMUState):
 
 
 class BalanceController:
-    def __init__(self, mode: Literal["smc", "mpc"] = CONTROLLER_MODE):
-        self.mode = mode
+    def __init__(self, tau_max: float):
         self.imu = IMUState()
-        self.robot = OmburoForce()
-        self.pitch_plant, self.roll_plant = make_plants(CTRL_DT)
-
-        if mode == "smc":
-            self.pitch_ctrl = AxisSMC(self.pitch_plant)
-            self.roll_ctrl = AxisSMC(self.roll_plant)
-        else:
-            self.pitch_ctrl = AxisMPC(self.pitch_plant)
-            self.roll_ctrl = AxisMPC(self.roll_plant)
+        self.robot = OmburoVel()
+        self.pitch_plant, self.roll_plant = make_plants()
+        self.pitch_ctrl = AxisSMC(self.pitch_plant, tau_max)
+        self.roll_ctrl = AxisSMC(self.roll_plant, tau_max)
 
         self._roll_offset = self._pitch_offset = 0.0
         self._phi_w_zero = self._phi_r_zero = 0.0
@@ -379,11 +301,11 @@ class BalanceController:
         self._phi_w_f = self._phi_r_f = 0.0
         self._step_count = 0
         self._softstart_steps = int(SOFTSTART_S * CTRL_HZ)
-        self._print_model_summary()
+        self._print_model_summary(tau_max)
 
-    def _print_model_summary(self) -> None:
+    def _print_model_summary(self, tau_max: float) -> None:
         pp, rp = self.pitch_plant, self.roll_plant
-        print(f"[model] m={M_BODY} kg  L_com={L_COM} m  TAU_MAX={TAU_MAX:.2f} Nm")
+        print(f"[model] m={M_BODY} kg  L_com={L_COM} m  tau_max={tau_max:.2f} Nm  vel_max={VEL_MAX} rad/s")
         print(f"[model] pitch θ̈: a21={pp.a21:.2f}  a22={pp.a22:.2f}  b21={pp.b21:.3f}")
         print(f"[model] roll  θ̈: a21={rp.a21:.2f}  a22={rp.a22:.2f}  b21={rp.b21:.3f}")
         wn = math.sqrt(abs(pp.a21))
@@ -415,10 +337,10 @@ class BalanceController:
             return
 
         self._calibrate()
-        self.robot.setForce(0.0, 0.0)
-        self.robot.setCurrentLimit(I_TEST_A)
+        self.robot.setVelocityMode()
+        self.robot.setVelocity(0.0, 0.0)
         self.robot.toggleTorque(1)
-        print(f"Balancing ({self.mode.upper()}, force mode) — Ctrl+C to stop\n")
+        print("Balancing (SMC, velocity mode) — Ctrl+C to stop\n")
 
         t_next = time.perf_counter()
         try:
@@ -434,9 +356,17 @@ class BalanceController:
         except KeyboardInterrupt:
             print("\nShutting down...")
         finally:
-            self.robot.setForce(0.0, 0.0)
+            self.robot.setVelocity(0.0, 0.0)
             self.robot.toggleTorque(0)
             self.robot.close()
+
+    def _torque_to_velocity(self, tau_pitch: float, tau_roll: float) -> tuple[float, float]:
+        """Map SMC torque to motor velocities (matches control2_Suraj wiring/signs)."""
+        pitch_cmd = -tau_pitch * N_ROLLER * TAU_TO_VEL
+        roll_cmd = tau_roll * TAU_TO_VEL
+        vel_wheel = float(np.clip(pitch_cmd, -VEL_MAX, VEL_MAX))
+        vel_roller = float(np.clip(roll_cmd, -VEL_MAX, VEL_MAX))
+        return vel_wheel, vel_roller
 
     def _step(self) -> None:
         self._step_count += 1
@@ -448,7 +378,7 @@ class BalanceController:
         pitchdot = PITCHDOT_SIGN * gyro[PITCHDOT_IDX]
 
         if abs(roll) > math.radians(FALL_DEG) or abs(pitch) > math.radians(FALL_DEG):
-            self.robot.setForce(0.0, 0.0)
+            self.robot.setVelocity(0.0, 0.0)
             return
 
         try:
@@ -476,47 +406,46 @@ class BalanceController:
         else:
             phi_w_s = phi_r_s = phi_w_ds = phi_r_ds = 0.0
 
-        if self.mode == "smc":
-            tau_pitch = self.pitch_ctrl.compute(pitch, pitchdot, phi_w_s, phi_w_ds)
-            tau_roll = self.roll_ctrl.compute(roll, rolldot, phi_r_s, phi_r_ds)
-        else:
-            x_pitch = np.array([phi_w_s, pitch, phi_w_ds, pitchdot])
-            x_roll = np.array([N_ROLLER * phi_r_s, roll, N_ROLLER * phi_r_ds, rolldot])
-            tau_pitch = self.pitch_ctrl.compute(x_pitch)
-            tau_roll = self.roll_ctrl.compute(x_roll)
+        tau_pitch = self.pitch_ctrl.compute(pitch, pitchdot, phi_w_s, phi_w_ds)
+        tau_roll = self.roll_ctrl.compute(roll, rolldot, phi_r_s, phi_r_ds)
 
         ramp = min(1.0, self._step_count / max(1, self._softstart_steps))
         tau_pitch *= ramp
         tau_roll *= ramp
 
-        self.robot.setForce(tau_pitch, tau_roll)
+        vel_wheel, vel_roller = self._torque_to_velocity(tau_pitch, tau_roll)
+        self.robot.setVelocity(vel_wheel, vel_roller)
 
         if self._step_count % 50 == 0:
             print(
-                f"\r[{self.mode}] roll={math.degrees(roll):+5.2f}° pitch={math.degrees(pitch):+5.2f}°  "
-                f"F_p={tau_pitch:+.2f} F_r={tau_roll:+.2f} Nm",
+                f"\r[smc] roll={math.degrees(roll):+5.2f}° pitch={math.degrees(pitch):+5.2f}°  "
+                f"τ_p={tau_pitch:+.2f} τ_r={tau_roll:+.2f} Nm  "
+                f"v_p={vel_wheel:+.1f} v_r={vel_roller:+.1f} rad/s",
                 end="",
                 flush=True,
             )
 
 
 def main():
-    global CONTROLLER_MODE, SMC_LAMBDA, SMC_K_SWITCH, I_TEST_A, TAU_MAX
+    global SMC_LAMBDA, SMC_K_SWITCH, TAU_TO_VEL
 
-    parser = argparse.ArgumentParser(description="SrOmBURo SMC/MPC balance (direct force mode)")
-    parser.add_argument("--mode", choices=["smc", "mpc"], default=CONTROLLER_MODE)
+    from OmburoVel import kt, iq as IQ_HW_LIMIT
+
+    parser = argparse.ArgumentParser(description="SrOmBURo SMC balance (velocity mode)")
     parser.add_argument("--lambda", dest="lambda_s", type=float, default=SMC_LAMBDA)
     parser.add_argument("--k-switch", type=float, default=SMC_K_SWITCH)
-    parser.add_argument("--i-test", type=float, default=I_TEST_A)
+    parser.add_argument("--tau-max", type=float, default=None,
+                        help="SMC torque saturation [Nm]; default kt*iq")
+    parser.add_argument("--tau-to-vel", type=float, default=TAU_TO_VEL,
+                        help="Torque-to-velocity scale [rad/s per Nm]")
     args = parser.parse_args()
 
-    CONTROLLER_MODE = args.mode
     SMC_LAMBDA = args.lambda_s
     SMC_K_SWITCH = args.k_switch
-    I_TEST_A = args.i_test
-    TAU_MAX = kt * min(IQ_HW_LIMIT, I_TEST_A)
+    TAU_TO_VEL = args.tau_to_vel
+    tau_max = args.tau_max if args.tau_max is not None else kt * IQ_HW_LIMIT
 
-    BalanceController(mode=CONTROLLER_MODE).run()
+    BalanceController(tau_max=tau_max).run()
 
 
 if __name__ == "__main__":

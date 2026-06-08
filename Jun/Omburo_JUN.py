@@ -1,4 +1,6 @@
+import sys
 import time
+sys.path.insert(0, "/home/omburo/Documents/PyBEAR_Jun")
 from pybear import Manager
 
 # MOTOR PARAMETERS

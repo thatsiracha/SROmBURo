@@ -8,11 +8,11 @@ Per-axis PD control law:
     v_cmd = Kp·θ + Kd·θ̇ + Kφ̇·φ̇ + Kφ·φ_pos   [rad/s]
 
 Motor output, matching the SrOmBURo BEAR wiring:
-    motor id2 (big wheel) = pitch_cmd          — corrects pitch (longitudinal)
-    motor id1 (roller)    = pitch_cmd + roll_cmd — differential roll correction
+    motor id2 (big wheel) = pitch_cmd — corrects pitch (longitudinal)
+    motor id1 (roller)    = roll_cmd  — corrects roll (lateral)
 
 OmburoVel.setVelocity() takes arguments in hardware order:
-    setVelocity(vel_wheel, vel_roller)
+    setVelocity(vel_wheel, vel_roller)   # vel_wheel → id2, vel_roller → id1
 
 Gain starting values scaled from OmburoRev2:
     Dynamixel unit → rad/s  ×0.01194  (0.114 RPM/unit × 2π/60)
@@ -39,8 +39,8 @@ IMU_PORT    = "/dev/ttyACM0"
 IMU_BAUD    = 115200
 IMU_RATE_HZ = 200          # must divide 500 evenly
 
-ID_WHEEL    = 2            # BEAR motor id2 (big wheel): receives pitch_cmd
-ID_ROLLER   = 1            # BEAR motor id1 (roller motor): receives pitch_cmd + roll_cmd
+ID_WHEEL    = 2            # BEAR motor id2 (big wheel): pitch axis → receives pitch_cmd
+ID_ROLLER   = 1            # BEAR motor id1 (roller):     roll axis  → receives roll_cmd
 
 # ── Physical parameters (SrOmBURo) ───────────────────────────────────────────
 R        = 0.101    # wheel radius [m]
@@ -63,15 +63,15 @@ CTRL_DT  = 1.0 / CTRL_HZ
 
 # ── Control gains ─────────────────────────────────────────────────────────────
 # Axis 1: roll correction, matching OmburoRev2 f1_goal
-K11 = 400.0   # roll angle gain
-K12 = 0.0   # rolldot gain
+K11 = 500.0   # roll angle gain
+K12 = 50.0   # rolldot gain
 K13 =  0.0   # φ̇ gain
 K14 =  0.0  # φ position gain (roll) — keep tiny
 H1  =  0.0   # feedforward — disabled
 
 # Axis 2: pitch correction, matching OmburoRev2 f2_goal
-K21 = 400.0   # pitch angle gain
-K22 =  0.0   # pitchdot gain
+K21 = 500.0   # pitch angle gain
+K22 =  50.0   # pitchdot gain
 K23 =  0.0   # φ̇ gain
 K24 =  0.0  # φ position gain (pitch) — keep tiny
 H2  =  0.0   # feedforward — disabled
@@ -233,8 +233,8 @@ class Controller:
         self._last_vw = 0.0     # last velocity command (readback fallback)
         self._last_vr = 0.0
 
-        self._phi_pitch_pos = 0.0  # pitch axis: motor id1 + motor id2
-        self._phi_roll_pos  = 0.0  # roll axis: motor id2
+        self._phi_pitch_pos = 0.0  # pitch axis: motor id2 (big wheel)
+        self._phi_roll_pos  = 0.0  # roll axis:  motor id1 (roller)
 
         self._roll_filt  = 0.0  # EMA-filtered states
         self._pitch_filt = 0.0
@@ -245,8 +245,8 @@ class Controller:
 
     def set_velocity_reference(self, vx_ms: float, vy_ms: float):
         """Set desired Cartesian velocity [m/s]. Call before or during run()."""
-        self._vref1 = vx_ms   # lateral      → wheel axis
-        self._vref2 = vy_ms   # longitudinal → roller axis
+        self._vref1 = vx_ms   # lateral      → roller axis (id1, roll)
+        self._vref2 = vy_ms   # longitudinal → wheel axis  (id2, pitch)
 
     def _calibrate(self, n=50):
         """Average roll/pitch over n samples to remove static IMU bias."""
@@ -327,13 +327,13 @@ class Controller:
         except Exception:
             vel_w, vel_r = self._last_vw, self._last_vr
 
-        # Match the BEAR motor wiring:
-        #   id2 = roll axis
-        #   id1 + id2 = pitch axis
-        motor2dot = vel_w
-        motor1dot = vel_r
-        phi_rolldot = motor2dot
-        phi_pitchdot = motor2dot + motor1dot
+        # Encoder → axis rates (matches BEAR wiring):
+        #   id1 (roller)    → roll axis
+        #   id2 (big wheel) → pitch axis
+        vel_id2 = vel_w   # id2 big wheel
+        vel_id1 = vel_r   # id1 roller
+        phi_rolldot  = vel_id1
+        phi_pitchdot = vel_id2
 
         # EMA low-pass filter
         a_ang  = EMA_ALPHA_ANG
@@ -360,12 +360,12 @@ class Controller:
         # Axis 2, pitch: OmburoRev2 f2_goal (PD). Roller coupling scale on pitch axis.
         pitch_cmd = -(K21 * pitch + K22 * pitchdot + K23 * phi_pitchdot + K24 * self._phi_pitch_pos) * N_ROLLER
 
-        # BEAR wiring: id2 (big wheel) = pitch_cmd; id1 (roller) = pitch_cmd + roll_cmd.
-        motor2_cmd = float(np.clip(pitch_cmd, -VEL_MAX, VEL_MAX))
-        motor1_cmd = float(np.clip(pitch_cmd + roll_cmd, -VEL_MAX, VEL_MAX))
-        self.robot.setVelocity(motor2_cmd, motor1_cmd)
-        self._last_vw = motor2_cmd
-        self._last_vr = motor1_cmd
+        # BEAR wiring: id2 (big wheel) = pitch_cmd; id1 (roller) = roll_cmd.
+        vel_wheel  = float(np.clip(pitch_cmd, -VEL_MAX, VEL_MAX))  # id2 → pitch
+        vel_roller = float(np.clip(roll_cmd,  -VEL_MAX, VEL_MAX))  # id1 → roll
+        self.robot.setVelocity(vel_wheel, vel_roller)
+        self._last_vw = vel_wheel
+        self._last_vr = vel_roller
 
         # Debug log at ~10 Hz
         if self._dbg_count % 20 == 0:
@@ -374,7 +374,7 @@ class Controller:
                 f"  angle : roll={math.degrees(roll):+6.2f}°  pitch={math.degrees(pitch):+6.2f}°\n"
                 f"  rate  : rdot={rolldot:+5.2f}  pdot={pitchdot:+5.2f}  rad/s\n"
                 f"  axis  : pitch_cmd={pitch_cmd:+6.2f}  roll_cmd={roll_cmd:+6.2f}  rad/s\n"
-                f"  motor : id2={motor2_cmd:+6.2f}  id1={motor1_cmd:+6.2f}  rad/s",
+                f"  motor : id2/pitch={vel_wheel:+6.2f}  id1/roll={vel_roller:+6.2f}  rad/s",
                 flush=True
             )
 

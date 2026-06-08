@@ -47,17 +47,19 @@ pitch_cmd = −(K21·pitch + K22·pitchdot + K23·φ̇_pitch + K24·φ_pitch_pos
 Assigning `motor2_cmd = roll_cmd_op` broke pitch: when pitch tilted, rollers spun
 but the big wheel stayed still because pitch_cmd no longer reached id2.
 
-### Final motor mapping
+### Final motor mapping (differential)
 
-| Motor | Role | Command |
-|-------|------|---------|
-| id2 (big wheel) | pitch | `pitch_cmd` |
-| id1 (roller motor) | roll differential | `pitch_cmd + roll_cmd` |
+| Motor | Command | Pure pitch | Pure roll |
+|-------|---------|------------|-----------|
+| id2 (big wheel) | `pitch_cmd − roll_cmd` | `+pitch` (spins) | `−roll` (cancels) |
+| id1 (roller motor) | `pitch_cmd + roll_cmd` | `+pitch` (spins) | `+roll` (opposite id2) |
 
 ```python
-motor2_cmd = clip(pitch_cmd)            # big wheel corrects pitch
-motor1_cmd = clip(pitch_cmd + roll_cmd) # roller: pitch coupling + roll correction
+motor2_cmd = clip(pitch_cmd - roll_cmd)  # roll: spins opposite to id1 → big wheel cancels
+motor1_cmd = clip(pitch_cmd + roll_cmd)  # roll: both motors spin, rollers move differentially
 ```
+
+Roll requires **both** motors to spin in **opposite** directions so rollers spin but the big wheel net rotation is zero. Sending roll only on id1 (`motor2 = pitch_cmd`) left the big wheel dragging.
 
 ---
 

@@ -62,23 +62,23 @@ class Config:
     # Paper convention (confirmed by hardware test):
     #   roll  (longitudinal, θ₁) = euler[1], sign = -1
     #   pitch (lateral,      θ₂) = euler[0], sign = +1
-    ROLL_EU_IDX   = 1;  ROLL_EU_SIGN   = 1.0   # longitudinal — was PITCH
-    PITCH_EU_IDX  = 0;  PITCH_EU_SIGN  =  -1.0   # lateral      — was ROLL
+    ROLL_EU_IDX   = 1;  ROLL_EU_SIGN   =  -1.0   # longitudinal — was PITCH
+    PITCH_EU_IDX  = 0;  PITCH_EU_SIGN  =  1.0   # lateral      — was ROLL
 
     ROLLDOT_IDX   = 1;  ROLLDOT_SIGN   = -1.0   # ωy → θ̇₁ (longitudinal rate)
     PITCHDOT_IDX  = 0;  PITCHDOT_SIGN  =  1.0   # ωx → θ̇₂ (lateral rate)
 
     # ── PID gains — ROLL axis (longitudinal, forward/backward) ───────────────
-    KP_ROLL  = 1.0   # Nm/rad
+    KP_ROLL  = 30.0   # Nm/rad
     KI_ROLL  =  0.0   # Nm/(rad·s) — start at 0, add slowly
-    KD_ROLL  =  0.3   # Nm·s/rad   (uses gyro directly, not finite diff)
-    KV_ROLL  =  0.01   # Nm/(rad/s) — wheel velocity damping
+    KD_ROLL  =  0.5   # Nm·s/rad   (uses gyro directly, not finite diff)
+    KV_ROLL  =  0.00   # Nm/(rad/s) — wheel velocity damping
 
     # ── PID gains — PITCH axis (lateral, side-to-side) ───────────────────────
-    KP_PITCH = 1.0
+    KP_PITCH = 30.0
     KI_PITCH =  0.0
-    KD_PITCH =  0.3
-    KV_PITCH =  0.005
+    KD_PITCH =  0.5
+    KV_PITCH =  0.00
 
     # ── Integrator anti-windup ────────────────────────────────────────────────
     INT_CAP_ROLL  = 0.3   # Nm — max integral contribution
@@ -86,8 +86,8 @@ class Config:
 
     # ── Safety ────────────────────────────────────────────────────────────────
     FALL_DEG     = 40.0   # cut motors if tilt exceeds this [deg]
-    MAX_TORQUE   = 1.5    # Nm per motor (BEAR limit: 1.5 A × kt 0.35 = 0.525 Nm)
-    MIN_TORQUE   = 0.005   # Nm — below this motors don't move; send 0
+    MAX_TORQUE   = 0.7    # Nm per motor (BEAR limit: 1.5 A × kt 0.35 = 0.525 Nm)
+    MIN_TORQUE   = 0.00   # Nm — below this motors don't move; send 0
 
     # ── EMA low-pass filter coefficients ─────────────────────────────────────
     # Higher α → more smoothing → more lag. Tune for noise/responsiveness.
@@ -97,6 +97,25 @@ class Config:
 
     # ── Calibration ───────────────────────────────────────────────────────────
     CALIB_SAMPLES = 100   # IMU samples to average for offset
+
+    # ── Feedforward Parameters (Gravity & Friction) ───────────────────────────
+    # 물리 파라미터 — 실측치로 교체할 것
+    M_TOTAL   = 5.0    # [kg]
+    G_ACCEL   = 9.81   # [m/s²]
+    L_COM     = 0.65   # [m] 무게중심 높이
+    R_WHEEL_ROLL  = 0.05   # [m] roll 축 유효 구동 반지름
+    R_WHEEL_PITCH = 0.04   # [m] pitch 축 유효 구동 반지름
+
+    # 중력 토크 (모터 기준): MGL·sin(θ) / (1 + L/r)
+    # leverage = 1 + L/r 로 나눠야 모터 출력 기준 실제값이 됨
+    MGL_TOTAL = M_TOTAL * G_ACCEL * L_COM   # 31.88 Nm (물리량)
+
+    # Coulomb Friction
+    FRIC_ROLL  = 0.05  # Nm
+    FRIC_PITCH = 0.05  # Nm
+
+    # tanh 마찰 보상 스케일 (클수록 sign에 가까움, 작을수록 부드러움)
+    FRIC_TANH_SCALE = 20.0   # 1/(rad/s)
 
     # ── Debug ─────────────────────────────────────────────────────────────────
     PRINT_EVERY = 50   # print every N control ticks (~10 Hz at 500 Hz)
@@ -560,15 +579,28 @@ class OmBUROPIDController:
         vel_roll_f  = self._vel_roll_filt
         vel_pitch_f = self._vel_pitch_filt
 
-        # ── 5. PID torque computation ─────────────────────────────────────────
-        tau_roll  = self.pid_roll.compute(roll_f,  rolldot_f,  vel_roll_f)
-        tau_pitch = self.pid_pitch.compute(pitch_f, pitchdot_f, vel_pitch_f)
+        # ── 5. PID + Feedforward 토크 계산 ───────────────────────────────────────
+        # 5.1 Feedback (PID)
+        tau_fb_roll  = self.pid_roll.compute(roll_f,  rolldot_f,  vel_roll_f)
+        tau_fb_pitch = -self.pid_pitch.compute(pitch_f, pitchdot_f, vel_pitch_f)
+
+        # 5.2 Gravity Feedforward: tau_motor = MGL·sin(θ) / (1 + L/r)
+        lev_roll  = 1.0 + cfg.L_COM / cfg.R_WHEEL_ROLL   # 예: 1 + 0.65/0.05 = 14
+        lev_pitch = 1.0 + cfg.L_COM / cfg.R_WHEEL_PITCH  # 예: 1 + 0.65/0.04 = 17.25
+        tau_ff_roll_g  = -cfg.MGL_TOTAL * math.sin(roll_f)  / lev_roll
+        tau_ff_pitch_g =  cfg.MGL_TOTAL * math.sin(pitch_f) / lev_pitch
+
+        # 5.3 Friction Feedforward (tanh — sign 대신 연속 함수로 채터링 방지)
+        tau_ff_roll_f  = -cfg.FRIC_ROLL  * math.tanh(rolldot_f  * cfg.FRIC_TANH_SCALE)
+        tau_ff_pitch_f =  cfg.FRIC_PITCH * math.tanh(pitchdot_f * cfg.FRIC_TANH_SCALE)
+
+        # Total = Feedback + Feedforward
+        tau_roll  = tau_fb_roll  + tau_ff_roll_g  + tau_ff_roll_f
+        tau_pitch = tau_fb_pitch + tau_ff_pitch_g + tau_ff_pitch_f
 
         # ── 6. Motor mixing (paper convention) ───────────────────────────────
-        #   motor id2 (wheel)  = roll torque
-        #   motor id1 (roller) = roll torque − pitch torque
-        tau_motor2 = tau_roll
-        tau_motor1 = tau_roll - tau_pitch
+        tau_motor2 = tau_roll + (tau_pitch / cfg.N_ROLLER)
+        tau_motor1 = tau_pitch
 
         # Saturate
         tau_motor2 = float(np.clip(tau_motor2, -cfg.MAX_TORQUE, cfg.MAX_TORQUE))

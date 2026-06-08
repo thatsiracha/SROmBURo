@@ -35,8 +35,8 @@ import time
 import numpy as np
 import serial
 
-sys.path.insert(0, "/home/omburo/Documents/SROmBURo")
-from Omburo import Omburo
+sys.path.insert(0, "/home/omburo/Documents/SROmBURo/Jun")
+from Omburo_JUN import Omburo
 
 # ── Hardware ──────────────────────────────────────────────────────────────────
 IMU_PORT    = "/dev/ttyACM0"

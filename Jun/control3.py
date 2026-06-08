@@ -28,8 +28,8 @@ import time
 import numpy as np
 import serial
 
-sys.path.insert(0, "/home/omburo/Documents/SROmBURo")
-from Omburo import Omburo
+sys.path.insert(0, "/home/omburo/Documents/SROmBURo/Jun")
+from Omburo_JUN import Omburo
 
 # ── LQR gains — computed by compute_lqr.py, pasted here as constants ──────────
 # Re-run `python3 compute_lqr.py` after changing physical params or Q/R weights,
@@ -97,7 +97,7 @@ USE_ENCODER_FEEDBACK_CURRENT = False
 # "control_ref": match control.py/control2.py output mixing:
 #                setVelocity(v_wheel, v_roller - v_wheel)
 # "independent": send wheel=u_pitch, roller=u_roll directly.
-TORQUE_MIX_MODE = "control_ref"
+TORQUE_MIX_MODE = "independent"
 
 # ── Hand-tuned velocity-mode gains (preserved, kept for comparison) ────────────
 # Wheel (longitudinal, pitch):

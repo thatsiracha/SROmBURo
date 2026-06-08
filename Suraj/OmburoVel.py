@@ -35,7 +35,7 @@ class OmburoVel:
         self.bear.set_i_gain_iq((id_wheel, 0.061), (id_roller, 0.061))
         self.bear.set_d_gain_iq((id_wheel, 0.0), (id_roller, 0.0))
 
-        self.bear.set_limit_i_max((id_wheel, 1.5), (id_roller, 1.5))
+        self.bear.set_limit_i_max((id_wheel, 6.0), (id_roller, 6.0))
 
     def getError(self):
         return (self.bear.ping(id_wheel)[0][1] and self.bear.ping(id_roller)[0][1])

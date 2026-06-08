@@ -1,486 +1,604 @@
-""""
-import numpy as np
-import time
-
-from Omburo import Omburo
-
-#Define Kp, Ki, Kd
-
-Kp = 1.0
-Ki = 0.1
-Kd = 0.05
-
-# Initialize Omburo
-omburo = Omburo()
-
-print("Starting Omburo test sequence...")
-print("=" * 60)
-
-BEAR_connected = omburo.getError()
-if not BEAR_connected:
-    print("Error: Unable to connect to BEAR. Please check connections and try again.")
-    exit(1)
-
-# Enable torque
-print("Enabling torque...")
-omburo.toggleTorque(1)
-
-ErrorX = 
-ErrorY = 
 """
-
-"""
-OmBURo PID Torque Controller
+SrOmBURo PID Torque Controller — Raspberry Pi
 Uses: MicrostrainIMU (microstrain_imu.py) + Omburo (Omburo.py)
 
-Architecture:
-  IMU → complementary filter → tilt angles
-  tilt error → PID → torque command → Omburo motors
+Naming convention matches the OmBURo paper (Shen & Hong, arXiv:2001.07856):
+    roll  (θ₁) — longitudinal tilt, forward/backward — motor id2 (wheel)
+    pitch (θ₂) — lateral tilt,      side-to-side      — motor id1 (roller)
+
+Note: this is the OPPOSITE of standard robotics convention but matches
+the paper. The previous code had these swapped.
+
+Control law per axis:
+    error    = 0 − angle                          (want upright = 0 rad)
+    integral += error · dt                        (anti-windup clamped)
+    torque   = Kp·error + Ki·integral + Kd·rate + Kv·wheel_velocity
+
+Motor mixing (from paper §IV, BEAR wiring):
+    motor id2 torque = roll_torque
+    motor id1 torque = roll_torque − pitch_torque
 
 Tuning order:
-  1. Run with KP=5, KD=0.1, KI=0. Robot should resist tipping.
-  2. Raise KP until it actively balances (try 10, 15, 20).
-  3. If it oscillates, raise KD (0.2, 0.3, 0.5).
-  4. Once stable, add KI=0.1 to correct steady lean.
-  5. Adjust KP_VEL (0.2-1.0) to slow wheel runaway.
+    1. KP_ROLL = 10, KD_ROLL = 0.2, KI_ROLL = 0  — get longitudinal balance
+    2. KP_PITCH = 10, KD_PITCH = 0.2, KI_PITCH = 0 — get lateral balance
+    3. Raise KP until it resists tipping, raise KD to kill oscillation
+    4. Add KI (0.1–0.5) only once KP/KD are stable
+    5. Add KV (0.2–1.0) to prevent runaway wheel spin
 """
 
-import time
-import signal
-import sys
 import math
+import struct
+import sys
+import threading
+import time
+
 import numpy as np
-from imu_read import read_packet
+import serial
+
+sys.path.insert(0, "/home/omburo/Documents/SROmBURo")
 from Omburo import Omburo
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CONFIGURATION — edit these values
+#  CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Config:
-    # Hardware ports
-    IMU_PORT   = "/dev/ttyACM0"
-    MOTOR_PORT = "/dev/ttyUSB0"   # set inside Omburo.py
+    # Ports
+    IMU_PORT    = "/dev/ttyACM0"
+    IMU_BAUD    = 115200
+    IMU_RATE_HZ = 200          # IMU sample rate — must divide 500 evenly
 
-    # Loop rate
-    LOOP_HZ    = 200              # Hz
-    DT         = 1.0 / LOOP_HZ   # seconds per tick
+    # Loop
+    CTRL_HZ = 500
+    CTRL_DT = 1.0 / CTRL_HZ
 
-    # IMU mounting
-    # True  → IMU Z-axis points DOWN  (accel_z ≈ -9.8 at rest)
-    # False → IMU Z-axis points UP    (accel_z ≈ +9.8 at rest)
-    IMU_INVERTED = True
+    # Physical
+    N_ROLLER = 4.0   # roller gear coupling (φ̇₂ = N·(φ̇_wheel + φ̇_roller))
 
-    # Complementary filter — how much to trust gyro vs accelerometer
-    # 0.98 = mostly gyro (fast), small accel correction (drift compensation)
-    COMP_ALPHA = 0.98
+    # ── IMU axis mapping ──────────────────────────────────────────────────────
+    # Paper convention (confirmed by hardware test):
+    #   roll  (longitudinal, θ₁) = euler[1], sign = -1
+    #   pitch (lateral,      θ₂) = euler[0], sign = +1
+    ROLL_EU_IDX   = 1;  ROLL_EU_SIGN   = -1.0   # longitudinal — was PITCH
+    PITCH_EU_IDX  = 0;  PITCH_EU_SIGN  =  1.0   # lateral      — was ROLL
 
-    # ── PID gains (longitudinal axis) ────────────────────────────────────────
-    # Output units: Nm at the wheel
-    KP_L  = 15.0   # proportional on tilt angle  (Nm/rad)
-    KI_L  =  0.0   # integral on tilt angle       (Nm/rad·s)  — start at 0
-    KD_L  =  0.3   # derivative on tilt rate      (Nm·s/rad)
+    ROLLDOT_IDX   = 1;  ROLLDOT_SIGN   = -1.0   # ωy → θ̇₁ (longitudinal rate)
+    PITCHDOT_IDX  = 0;  PITCHDOT_SIGN  =  1.0   # ωx → θ̇₂ (lateral rate)
 
-    # ── PID gains (lateral axis) ─────────────────────────────────────────────
-    KP_LAT = 15.0
-    KI_LAT =  0.0
-    KD_LAT =  0.3
+    # ── PID gains — ROLL axis (longitudinal, forward/backward) ───────────────
+    KP_ROLL  = 15.0   # Nm/rad
+    KI_ROLL  =  0.0   # Nm/(rad·s) — start at 0, add slowly
+    KD_ROLL  =  0.3   # Nm·s/rad   (uses gyro directly, not finite diff)
+    KV_ROLL  =  0.5   # Nm/(rad/s) — wheel velocity damping
 
-    # ── Velocity damping ─────────────────────────────────────────────────────
-    # Adds a braking torque proportional to wheel speed to stop runaway rolling
-    KP_VEL_L   = 0.5   # Nm/(rad/s)
-    KP_VEL_LAT = 0.5
+    # ── PID gains — PITCH axis (lateral, side-to-side) ───────────────────────
+    KP_PITCH = 15.0
+    KI_PITCH =  0.0
+    KD_PITCH =  0.3
+    KV_PITCH =  0.5
 
-    # ── Safety limits ────────────────────────────────────────────────────────
-    MAX_TORQUE_NM   = 0.5    # Nm per motor — BEAR limit_i_max=1.5 A × kt=0.35 = 0.525 Nm
-    MIN_TORQUE_NM   = 0.05   # Nm — below this motors don't move; send 0 instead
-    MAX_TILT_DEG    = 45.0   # degrees — cut torque if robot has fallen over
-    INTEGRATOR_CAP  = 0.3    # Nm — anti-windup clamp on integral term
+    # ── Integrator anti-windup ────────────────────────────────────────────────
+    INT_CAP_ROLL  = 0.3   # Nm — max integral contribution
+    INT_CAP_PITCH = 0.3
 
-    # ── Tilt deadband ────────────────────────────────────────────────────────
-    # Ignore tilt angles smaller than this (sensor noise suppression)
-    DEADBAND_RAD = math.radians(0.5)   # 0.5 degrees
+    # ── Safety ────────────────────────────────────────────────────────────────
+    FALL_DEG     = 40.0   # cut motors if tilt exceeds this [deg]
+    MAX_TORQUE   = 0.5    # Nm per motor (BEAR limit: 1.5 A × kt 0.35 = 0.525 Nm)
+    MIN_TORQUE   = 0.05   # Nm — below this motors don't move; send 0
 
-    # ── Debug printing ───────────────────────────────────────────────────────
-    PRINT_EVERY = 40   # print every N ticks (~5 Hz at 200 Hz)
+    # ── EMA low-pass filter coefficients ─────────────────────────────────────
+    # Higher α → more smoothing → more lag. Tune for noise/responsiveness.
+    EMA_ANG  = 0.20   # angle  (~8 Hz cutoff at 500 Hz loop)
+    EMA_RATE = 0.35   # gyro rate
+    EMA_VEL  = 0.60   # wheel velocity (encoder noisier than gyro)
 
+    # ── Calibration ───────────────────────────────────────────────────────────
+    CALIB_SAMPLES = 100   # IMU samples to average for offset
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  TILT ESTIMATOR
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TiltEstimator:
-    """
-    Complementary filter combining IMU gyroscope and accelerometer.
-
-    State:
-        theta_l   — longitudinal tilt (rad) — positive = top leans forward
-        theta_lat — lateral tilt (rad)      — positive = top leans left
-
-    The filter trusts the gyroscope for fast dynamics and the accelerometer
-    for slow drift correction. COMP_ALPHA controls the blend (0.98 → 98% gyro).
-    """
-
-    def __init__(self, cfg: Config):
-        self.cfg       = cfg
-        self.theta_l   = 0.0
-        self.theta_lat = 0.0
-
-    def update(self, reading: IMUReading, dt: float) -> tuple[float, float, float, float]:
-        """
-        Returns (theta_l, dtheta_l, theta_lat, dtheta_lat) in radians and rad/s.
-        """
-        ax, ay, az = reading.accel_x, reading.accel_y, reading.accel_z
-        gx, gy     = reading.gyro_x,  reading.gyro_y
-
-        # Correct for inverted mounting
-        if self.cfg.IMU_INVERTED:
-            az = -az
-            gy = -gy
-
-        # Accelerometer angle estimate (only valid when nearly static)
-        theta_l_acc   = math.atan2(ax, az)
-        theta_lat_acc = math.atan2(ay, az)
-
-        # Complementary filter integration
-        a = self.cfg.COMP_ALPHA
-        self.theta_l   = a * (self.theta_l   + gy * dt) + (1.0 - a) * theta_l_acc
-        self.theta_lat = a * (self.theta_lat + gx * dt) + (1.0 - a) * theta_lat_acc
-
-        return self.theta_l, gy, self.theta_lat, gx
-
-    def reset(self):
-        self.theta_l   = 0.0
-        self.theta_lat = 0.0
+    # ── Debug ─────────────────────────────────────────────────────────────────
+    PRINT_EVERY = 50   # print every N control ticks (~10 Hz at 500 Hz)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PID CONTROLLER (per axis)
+#  MIP (MicroStrain Inertial Protocol) — IMU driver
 # ══════════════════════════════════════════════════════════════════════════════
 
-class PIDAxis:
+MIP_SYNC1 = 0x75;  MIP_SYNC2 = 0x65
+DESC_BASE = 0x01;  DESC_3DM  = 0x0C;  DESC_IMU = 0x80
+FIELD_GYRO = 0x05; FIELD_EULER = 0x0C
+MIP_BASE_RATE = 500
+
+def _fletcher(data: bytes) -> tuple[int, int]:
+    b1 = b2 = 0
+    for b in data:
+        b1 = (b1 + b) & 0xFF
+        b2 = (b2 + b1) & 0xFF
+    return b1, b2
+
+def _build_field(desc: int, data: bytes = b"") -> bytes:
+    return bytes([len(data) + 2, desc]) + data
+
+def _build_packet(desc_set: int, fields: list[bytes]) -> bytes:
+    payload = b"".join(fields)
+    header  = bytes([MIP_SYNC1, MIP_SYNC2, desc_set, len(payload)])
+    body    = header + payload
+    cs1, cs2 = _fletcher(body)
+    return body + bytes([cs1, cs2])
+
+def _cmd_ping() -> bytes:
+    return _build_packet(DESC_BASE, [_build_field(0x01)])
+
+def _cmd_imu_format(rate_hz: int, field_list: list[int]) -> bytes:
+    dec  = max(1, MIP_BASE_RATE // rate_hz)
+    data = bytes([0x01, len(field_list)])
+    for f in field_list:
+        data += bytes([f, dec >> 8, dec & 0xFF])
+    return _build_packet(DESC_3DM, [_build_field(0x08, data)])
+
+def _cmd_imu_stream(enable: bool) -> bytes:
+    data = bytes([0x01, 0x01, 0x01 if enable else 0x00])
+    return _build_packet(DESC_3DM, [_build_field(0x11, data)])
+
+def _read_mip_packet(ser: serial.Serial,
+                     timeout: float = 2.0) -> tuple[int, bytes] | None:
+    deadline = time.time() + timeout
+    buf = b""
+    while time.time() < deadline:
+        chunk = ser.read(ser.in_waiting or 1)
+        if not chunk:
+            continue
+        buf += chunk
+        while True:
+            idx = buf.find(bytes([MIP_SYNC1, MIP_SYNC2]))
+            if idx == -1:
+                buf = buf[-1:]; break
+            buf = buf[idx:]
+            if len(buf) < 4: break
+            plen  = buf[3]
+            total = 4 + plen + 2
+            if len(buf) < total: break
+            pkt = buf[:total]
+            if _fletcher(pkt[:-2]) != (pkt[-2], pkt[-1]):
+                buf = buf[1:]; continue
+            buf = buf[total:]
+            return pkt[2], pkt[4: 4 + plen]
+    return None
+
+def _imu_ack(ser: serial.Serial, pkt: bytes,
+             cmd_desc: int, retries: int = 3) -> bool:
+    for _ in range(retries):
+        ser.reset_input_buffer()
+        ser.write(pkt)
+        deadline = time.time() + 1.5
+        while time.time() < deadline:
+            r = _read_mip_packet(ser, timeout=deadline - time.time())
+            if r is None:
+                break
+            ds, pl = r
+            if ds == DESC_IMU:
+                continue
+            if len(pl) >= 4 and pl[1] == 0xF1:
+                if pl[2] == cmd_desc and pl[3] == 0x00:
+                    return True
+                break
+    return False
+
+def _parse_imu_payload(payload: bytes) -> tuple:
+    """Returns (euler_deg_tuple, gyro_rads_tuple) or (None, None)."""
+    euler = gyro = None
+    i = 0
+    while i + 1 < len(payload):
+        flen  = payload[i]
+        fdesc = payload[i + 1]
+        fdata = payload[i + 2: i + flen]
+        if fdesc == FIELD_EULER and len(fdata) >= 12:
+            r, p, y   = struct.unpack(">fff", fdata[:12])
+            euler = (math.degrees(r), math.degrees(p), math.degrees(y))
+        elif fdesc == FIELD_GYRO and len(fdata) >= 12:
+            gyro = struct.unpack(">fff", fdata[:12])
+        i += max(flen, 1)
+    return euler, gyro
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  THREAD-SAFE IMU STATE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class IMUState:
+    """Shared memory between IMU reader thread and control loop."""
+
+    def __init__(self):
+        self._lock   = threading.Lock()
+        self.euler   = (0.0, 0.0, 0.0)   # (roll_deg, pitch_deg, yaw_deg)
+        self.gyro    = (0.0, 0.0, 0.0)   # (ωx, ωy, ωz) rad/s
+        self.updated = threading.Event()
+
+    def push(self, euler=None, gyro=None):
+        with self._lock:
+            if euler is not None: self.euler = euler
+            if gyro  is not None: self.gyro  = gyro
+        self.updated.set()
+
+    def get(self) -> tuple:
+        with self._lock:
+            return self.euler, self.gyro
+
+
+def _imu_reader_thread(state: IMUState, cfg: Config):
+    """Runs in a daemon thread. Reconnects automatically on serial errors."""
+    try:
+        with serial.Serial(cfg.IMU_PORT, cfg.IMU_BAUD,
+                           timeout=0.05, dsrdtr=False, rtscts=False) as ser:
+            time.sleep(1.5)
+            ser.reset_input_buffer()
+
+            if not _imu_ack(ser, _cmd_ping(), 0x01):
+                print("[IMU] No ping response — check cable and power"); return
+
+            _imu_ack(ser, _cmd_imu_stream(False), 0x11)   # stop any old stream
+            time.sleep(0.1); ser.reset_input_buffer()
+
+            if not _imu_ack(ser,
+                            _cmd_imu_format(cfg.IMU_RATE_HZ,
+                                            [FIELD_EULER, FIELD_GYRO]), 0x08):
+                print("[IMU] Format config failed"); return
+
+            if not _imu_ack(ser, _cmd_imu_stream(True), 0x11):
+                print("[IMU] Stream enable failed"); return
+
+            print("[IMU] Stream active")
+            while True:
+                r = _read_mip_packet(ser, timeout=0.5)
+                if r is None:
+                    continue
+                ds, pl = r
+                if ds != DESC_IMU:
+                    continue
+                euler, gyro = _parse_imu_payload(pl)
+                state.push(euler=euler, gyro=gyro)
+
+    except Exception as exc:
+        print(f"[IMU] Thread error: {exc}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PID CONTROLLER (one instance per axis)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PIDTorque:
     """
-    Single-axis PID controller with anti-windup and derivative filtering.
-    Output is a torque command in Nm.
+    Single-axis PID controller. Output is torque in Nm.
+
+    Uses gyroscope angular rate directly for the derivative term — avoids
+    noisy finite-differencing of the filtered angle estimate.
     """
 
-    DERIV_FILTER_ALPHA = 0.7   # low-pass on derivative (0=none, 1=heavy)
+    DERIV_LP_ALPHA = 0.7   # low-pass on derivative output (0 = none, 1 = heavy)
 
-    def __init__(self, kp: float, ki: float, kd: float,
-                 integrator_cap: float, dt: float):
-        self.kp  = kp
-        self.ki  = ki
-        self.kd  = kd
-        self.cap = integrator_cap
-        self.dt  = dt
+    def __init__(self, kp: float, ki: float, kd: float, kv: float,
+                 int_cap: float, dt: float):
+        self.kp      = kp
+        self.ki      = ki
+        self.kd      = kd
+        self.kv      = kv       # wheel velocity damping gain
+        self.int_cap = int_cap
+        self.dt      = dt
 
-        self._integral    = 0.0
-        self._prev_error  = 0.0
-        self._deriv_filt  = 0.0
+        self._integral  = 0.0
+        self._deriv_lp  = 0.0
 
-    def compute(self, error: float, rate: float) -> float:
+    def compute(self, angle: float, rate: float, wheel_vel: float) -> float:
         """
-        error : setpoint − measurement (rad)
-        rate  : derivative of measurement from gyroscope (rad/s)
-                (using gyro directly is more accurate than finite-difference)
-        Returns torque command (Nm).
+        angle     : tilt angle (rad) — positive means leaning in one direction
+        rate      : angular rate from gyro (rad/s)
+        wheel_vel : wheel/roller encoder velocity (rad/s)
+        Returns   : torque command (Nm) — sign convention: positive torque
+                    opposes positive tilt.
         """
+        error = -angle   # negative: positive tilt → we want negative torque
+
         # Proportional
         p = self.kp * error
 
-        # Integral with anti-windup clamp
-        self._integral = np.clip(
+        # Integral with anti-windup
+        self._integral = float(np.clip(
             self._integral + error * self.dt,
-            -self.cap, self.cap
-        )
+            -self.int_cap / max(self.ki, 1e-9),
+            +self.int_cap / max(self.ki, 1e-9),
+        ))
         i = self.ki * self._integral
 
-        # Derivative from gyroscope (negative: gyro measures rate of change)
-        raw_d = -self.kd * rate
-        self._deriv_filt = (self.DERIV_FILTER_ALPHA * self._deriv_filt +
-                            (1.0 - self.DERIV_FILTER_ALPHA) * raw_d)
-        d = self._deriv_filt
+        # Derivative from gyro (low-pass filtered)
+        raw_d = -self.kd * rate   # negative: rate in same direction as tilt
+        self._deriv_lp = (self.DERIV_LP_ALPHA * self._deriv_lp +
+                          (1.0 - self.DERIV_LP_ALPHA) * raw_d)
+        d = self._deriv_lp
 
-        return p + i + d
+        # Velocity damping
+        v = -self.kv * wheel_vel
+
+        return p + i + d + v
 
     def reset(self):
-        self._integral   = 0.0
-        self._prev_error = 0.0
-        self._deriv_filt = 0.0
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  MOTOR MIXER
-# ══════════════════════════════════════════════════════════════════════════════
-
-class MotorMixer:
-    """
-    Combines longitudinal and lateral torque commands into per-motor commands.
-
-    OmBURo mixing convention:
-        tau_wheel  = (u_long + u_lat) / 2
-        tau_roller = (u_long - u_lat) / 2
-    """
-
-    def __init__(self, cfg: Config, robot: Omburo):
-        self.cfg   = cfg
-        self.robot = robot
-
-    def send(self, u_long: float, u_lat: float) -> tuple[float, float]:
-        tau_wheel  = (u_long + u_lat) / 2.0
-        tau_roller = (u_long - u_lat) / 2.0
-
-        # Saturate
-        tau_wheel  = np.clip(tau_wheel,  -self.cfg.MAX_TORQUE_NM, self.cfg.MAX_TORQUE_NM)
-        tau_roller = np.clip(tau_roller, -self.cfg.MAX_TORQUE_NM, self.cfg.MAX_TORQUE_NM)
-
-        # Threshold: send zero if below motor noise floor
-        if abs(tau_wheel)  < self.cfg.MIN_TORQUE_NM: tau_wheel  = 0.0
-        if abs(tau_roller) < self.cfg.MIN_TORQUE_NM: tau_roller = 0.0
-
-        self.robot.setTorque(tau_wheel, tau_roller)
-        return tau_wheel, tau_roller
-
-    def stop(self):
-        self.robot.setTorque(0.0, 0.0)
+        self._integral = 0.0
+        self._deriv_lp = 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAIN CONTROLLER
 # ══════════════════════════════════════════════════════════════════════════════
 
-class OmBUROController:
+class OmBUROPIDController:
     """
-    Top-level PID torque controller for OmBURo.
+    PID torque balancing controller for SrOmBURo.
 
-    Startup sequence:
-        1. Connect IMU, wait for valid data
-        2. Check motor comms
-        3. Tilt sanity check (confirm angles near zero)
-        4. Motor smoke test (send small pulse, check readback)
-        5. Enter 200 Hz control loop
+    Naming follows the paper:
+        roll  = longitudinal axis (forward/backward tilt, θ₁)
+        pitch = lateral axis      (side-to-side tilt,    θ₂)
     """
 
     def __init__(self):
-        self.cfg      = Config()
-        self.imu      = MicrostrainIMU(port=self.cfg.IMU_PORT,
-                                       sample_rate_hz=200,
-                                       background=True)
-        self.robot    = Omburo()
-        self.estimator = TiltEstimator(self.cfg)
-        self.pid_l    = PIDAxis(self.cfg.KP_L,  self.cfg.KI_L,  self.cfg.KD_L,
-                                self.cfg.INTEGRATOR_CAP, self.cfg.DT)
-        self.pid_lat  = PIDAxis(self.cfg.KP_LAT, self.cfg.KI_LAT, self.cfg.KD_LAT,
-                                self.cfg.INTEGRATOR_CAP, self.cfg.DT)
-        self.mixer    = MotorMixer(self.cfg, self.robot)
+        self.cfg   = Config()
+        self.imu   = IMUState()
+        self.robot = Omburo()
+
+        self.pid_roll  = PIDTorque(
+            kp=self.cfg.KP_ROLL,  ki=self.cfg.KI_ROLL,
+            kd=self.cfg.KD_ROLL,  kv=self.cfg.KV_ROLL,
+            int_cap=self.cfg.INT_CAP_ROLL, dt=self.cfg.CTRL_DT
+        )
+        self.pid_pitch = PIDTorque(
+            kp=self.cfg.KP_PITCH, ki=self.cfg.KI_PITCH,
+            kd=self.cfg.KD_PITCH, kv=self.cfg.KV_PITCH,
+            int_cap=self.cfg.INT_CAP_PITCH, dt=self.cfg.CTRL_DT
+        )
+
+        # EMA filter states — roll axis (longitudinal)
+        self._roll_filt      = 0.0
+        self._rolldot_filt   = 0.0
+        self._vel_roll_filt  = 0.0   # motor id2 velocity
+
+        # EMA filter states — pitch axis (lateral)
+        self._pitch_filt     = 0.0
+        self._pitchdot_filt  = 0.0
+        self._vel_pitch_filt = 0.0   # motor id1+id2 velocity
+
+        # Calibration offsets
+        self._roll_offset  = 0.0
+        self._pitch_offset = 0.0
+
+        # Fallback encoder values
+        self._last_vel_w = 0.0
+        self._last_vel_r = 0.0
 
         self._running = False
-        signal.signal(signal.SIGINT,  self._shutdown)
-        signal.signal(signal.SIGTERM, self._shutdown)
 
-    # ── Startup ───────────────────────────────────────────────────────────────
+    # ── Public API ─────────────────────────────────────────────────────────────
 
-    def start(self):
+    def run(self):
+        """Start IMU thread, calibrate, then enter 500 Hz control loop."""
         print("=" * 60)
-        print("  OmBURo PID Torque Controller")
+        print("  SrOmBURo PID Torque Controller")
+        print("  Axes: roll=longitudinal(θ₁)  pitch=lateral(θ₂)")
         print("=" * 60)
 
-        self._connect_imu()
-        self._check_motors()
-        self._tilt_sanity_check()
-        self._motor_smoke_test()
+        # Start IMU background thread
+        t = threading.Thread(target=_imu_reader_thread,
+                             args=(self.imu, self.cfg), daemon=True)
+        t.start()
+
+        print("[Init] Waiting for first IMU packet...")
+        if not self.imu.updated.wait(timeout=8.0):
+            print("[ERROR] IMU did not respond in 8 s — check cable"); return
+
+        # Switch to torque/current control mode
+        self._set_torque_mode()
+
+        # Calibrate static offsets
+        self._calibrate()
 
         self.robot.toggleTorque(1)
         time.sleep(0.2)
 
-        print(f"\n[Controller] Loop rate : {self.cfg.LOOP_HZ} Hz")
-        print(f"[Controller] KP={self.cfg.KP_L}  KI={self.cfg.KI_L}  "
-              f"KD={self.cfg.KD_L}  MAX_TAU={self.cfg.MAX_TORQUE_NM} Nm")
-        print("[Controller] Running — Ctrl-C to stop.\n")
+        print(f"\n[Init] Loop rate : {self.cfg.CTRL_HZ} Hz")
+        print(f"[Init] KP_ROLL={self.cfg.KP_ROLL}  KD_ROLL={self.cfg.KD_ROLL}  "
+              f"KI_ROLL={self.cfg.KI_ROLL}")
+        print(f"[Init] KP_PITCH={self.cfg.KP_PITCH}  KD_PITCH={self.cfg.KD_PITCH}  "
+              f"KI_PITCH={self.cfg.KI_PITCH}")
+        print(f"[Init] MAX_TORQUE={self.cfg.MAX_TORQUE} Nm  "
+              f"FALL_STOP={self.cfg.FALL_DEG}°")
+        print("[Init] Balancing active — Ctrl+C to stop\n")
 
         self._running = True
-        self._loop()
+        self._control_loop()
 
-    # ── IMU connection ────────────────────────────────────────────────────────
+    # ── Hardware helpers ───────────────────────────────────────────────────────
 
-    def _connect_imu(self):
-        print("\n[IMU] Connecting...")
-        if not self.imu.connect():
-            print("[IMU] Failed — check /dev/ttyACM0"); sys.exit(1)
+    def _set_torque_mode(self):
+        """Switch BEAR motors to current (torque) control mode = 0."""
+        try:
+            self.robot.bear.set_mode((self.robot.bear.id_wheel,  0),
+                                     (self.robot.bear.id_roller, 0))
+        except AttributeError:
+            # Fallback: access bear internals directly
+            try:
+                from pybear import Manager
+                self.robot.bear.bear.set_mode(
+                    (2, 0), (1, 0)   # id_wheel=2, id_roller=1
+                )
+            except Exception:
+                pass   # if mode switching fails, setTorque() still works
 
-        print("[IMU] Waiting for first valid reading...")
-        t0 = time.time()
-        while not self.imu.latest.valid:
-            if time.time() - t0 > 5.0:
-                print("[IMU] Timeout — no data after 5 s")
-                self.imu.disconnect(); sys.exit(1)
-            time.sleep(0.01)
-        r = self.imu.latest
-        print(f"[IMU] Ready.  "
-              f"accel=({r.accel_x:+.2f},{r.accel_y:+.2f},{r.accel_z:+.2f}) m/s²  "
-              f"gyro=({r.gyro_x:+.3f},{r.gyro_y:+.3f},{r.gyro_z:+.3f}) rad/s")
+    # ── Calibration ────────────────────────────────────────────────────────────
 
-    # ── Motor check ───────────────────────────────────────────────────────────
+    def _calibrate(self):
+        """
+        Average IMU output over N samples to compute static angle offsets.
+        Robot must be upright and still during calibration.
+        """
+        n = self.cfg.CALIB_SAMPLES
+        print(f"[Calib] Averaging {n} IMU samples — hold robot STILL and UPRIGHT...")
+        roll_sum = pitch_sum = 0.0
+        collected = 0
+        while collected < n:
+            self.imu.updated.wait(); self.imu.updated.clear()
+            euler, _ = self.imu.get()
+            roll_sum  += (self.cfg.ROLL_EU_SIGN  *
+                          math.radians(euler[self.cfg.ROLL_EU_IDX]))
+            pitch_sum += (self.cfg.PITCH_EU_SIGN *
+                          math.radians(euler[self.cfg.PITCH_EU_IDX]))
+            collected += 1
 
-    def _check_motors(self):
-        print("\n[Motors] Pinging BEAR actuators...")
-        if not self.robot.getError():
-            print("[Motors] Ping failed — check /dev/ttyUSB0 and power")
-            self.imu.disconnect(); sys.exit(1)
-        print("[Motors] Both motors responding.")
+        self._roll_offset  = roll_sum  / n
+        self._pitch_offset = pitch_sum / n
+        self.pid_roll.reset()
+        self.pid_pitch.reset()
 
-    # ── Tilt sanity ───────────────────────────────────────────────────────────
+        print(f"[Calib] roll_offset  = {math.degrees(self._roll_offset):+.3f}°  "
+              f"pitch_offset = {math.degrees(self._pitch_offset):+.3f}°")
 
-    def _tilt_sanity_check(self):
-        print("\n[Tilt] Sampling 0.5 s of resting angles — keep robot still...")
-        samples = []
-        t0 = time.time()
-        while time.time() - t0 < 0.5:
-            r = self.imu.latest
-            if r.valid:
-                ax, ay, az = r.accel_x, r.accel_y, r.accel_z
-                if self.cfg.IMU_INVERTED: az = -az
-                samples.append((math.degrees(math.atan2(ax, az)),
-                                math.degrees(math.atan2(ay, az))))
-            time.sleep(0.005)
+    # ── 500 Hz control loop ─────────────────────────────────────────────────────
 
-        if not samples:
-            print("[Tilt] No samples — cannot verify."); return
+    def _control_loop(self):
+        cfg     = self.cfg
+        t_next  = time.perf_counter()
+        tick    = 0
+        hz_tick = 0
+        hz_t0   = time.perf_counter()
 
-        avg_l, avg_lat = np.mean(samples, axis=0)
-        std_l, std_lat = np.std(samples,  axis=0)
-        print(f"[Tilt] theta_l  = {avg_l:+.2f}° ± {std_l:.2f}°")
-        print(f"[Tilt] theta_lat= {avg_lat:+.2f}° ± {std_lat:.2f}°")
+        try:
+            while self._running:
+                # Precise timing: sleep most of the interval, busy-wait the rest
+                now  = time.perf_counter()
+                wait = t_next - now
+                if wait > 0:
+                    time.sleep(wait * 0.85)
+                    while time.perf_counter() < t_next:
+                        pass
+                t_next += cfg.CTRL_DT
+                tick   += 1
+                hz_tick += 1
 
-        if abs(avg_l) > 20 or abs(avg_lat) > 20:
-            print("[Tilt] WARNING: angles > 20° — robot may not be upright, "
-                  "or set IMU_INVERTED = False in Config.")
-        elif abs(avg_l) > 5 or abs(avg_lat) > 5:
-            print("[Tilt] NOTE: angles > 5° — robot is leaning. "
-                  "Balance it upright before releasing.")
-        else:
-            print("[Tilt] Angles look good.")
+                self._step(tick)
 
-    # ── Motor smoke test ──────────────────────────────────────────────────────
+                if hz_tick >= 250:
+                    elapsed = time.perf_counter() - hz_t0
+                    print(f"\r[loop] {hz_tick / elapsed:.1f} Hz", end="", flush=True)
+                    hz_tick = 0
+                    hz_t0   = time.perf_counter()
 
-    def _motor_smoke_test(self):
-        print("\n[Smoke] Sending 0.2 Nm to both motors for 0.3 s...")
-        self.robot.toggleTorque(1)
-        time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("\n[Controller] Stopping...")
+        finally:
+            self._stop()
 
-        t0 = time.time()
-        while time.time() - t0 < 0.3:
-            self.robot.setTorque(0.2, 0.2)
-            time.sleep(0.005)
-        self.robot.setTorque(0.0, 0.0)
-        time.sleep(0.1)
+    # ── Single control step ─────────────────────────────────────────────────────
 
-        _, vw, _, vr = self.robot.readback()
-        print(f"[Smoke] Post-pulse velocity: wheel={vw:+.4f} rad/s  roller={vr:+.4f} rad/s")
+    def _step(self, tick: int):
+        cfg = self.cfg
+        euler, gyro = self.imu.get()
 
-        if abs(vw) < 0.005 and abs(vr) < 0.005:
-            print("[Smoke] WARNING: no velocity response — verify:")
-            print("        • pybear mode=1 (current control)")
-            print("        • kt=0.35 correct for your motor")
-            print("        • BEAR firmware version compatible with pybear")
-            print("        Continuing anyway — gains may need to be higher.")
-        else:
-            print("[Smoke] Motors confirmed responding.")
+        # ── 1. Sensor → body angles (paper convention) ──────────────────────
+        roll  = (cfg.ROLL_EU_SIGN  * math.radians(euler[cfg.ROLL_EU_IDX])
+                 - self._roll_offset)
+        pitch = (cfg.PITCH_EU_SIGN * math.radians(euler[cfg.PITCH_EU_IDX])
+                 - self._pitch_offset)
 
-        self.robot.toggleTorque(0)
-        time.sleep(0.1)
+        rolldot  = cfg.ROLLDOT_SIGN  * gyro[cfg.ROLLDOT_IDX]
+        pitchdot = cfg.PITCHDOT_SIGN * gyro[cfg.PITCHDOT_IDX]
 
-    # ── Main 200 Hz loop ──────────────────────────────────────────────────────
-
-    def _loop(self):
-        tick = 0
-        dt   = self.cfg.DT
-
-        while self._running:
-            t0 = time.perf_counter()
-            tick += 1
-
-            # 1. Read sensors ─────────────────────────────────────────────────
-            reading = self.imu.latest
-            _, vel_wheel, _, vel_roller = self.robot.readback()
-
-            # 2. Guard: invalid IMU ───────────────────────────────────────────
-            if not reading.valid:
-                self.mixer.stop()
-                time.sleep(max(0.0, dt - (time.perf_counter() - t0)))
-                continue
-
-            # 3. Tilt estimation ──────────────────────────────────────────────
-            theta_l, dtheta_l, theta_lat, dtheta_lat = \
-                self.estimator.update(reading, dt)
-
-            # 4. Safety cutoff: fallen over ───────────────────────────────────
-            max_rad = math.radians(self.cfg.MAX_TILT_DEG)
-            if abs(theta_l) > max_rad or abs(theta_lat) > max_rad:
-                self.mixer.stop()
-                if tick % self.cfg.PRINT_EVERY == 0:
-                    print(f"[Safety] Tilt exceeded {self.cfg.MAX_TILT_DEG}° — "
-                          f"theta_l={math.degrees(theta_l):.1f}°  "
-                          f"theta_lat={math.degrees(theta_lat):.1f}°  "
-                          f"Motors OFF.")
-                time.sleep(max(0.0, dt - (time.perf_counter() - t0)))
-                continue
-
-            # 5. PID on tilt (setpoint = 0 rad = upright) ─────────────────────
-            def db(v):
-                # Deadband: zero out small angles so motor doesn't chatter
-                return 0.0 if abs(v) < self.cfg.DEADBAND_RAD else v
-
-            u_long = (self.pid_l.compute(db(theta_l),    dtheta_l) +
-                      self.cfg.KP_VEL_L   * vel_wheel)
-
-            u_lat  = (self.pid_lat.compute(db(theta_lat), dtheta_lat) +
-                      self.cfg.KP_VEL_LAT * vel_roller)
-
-            # 6. Mix and send ─────────────────────────────────────────────────
-            tau_w, tau_r = self.mixer.send(u_long, u_lat)
-
-            # 7. Debug print ──────────────────────────────────────────────────
-            if tick % self.cfg.PRINT_EVERY == 0:
-                self._print(tick * dt, theta_l, dtheta_l, theta_lat,
-                            vel_wheel, u_long, u_lat, tau_w, tau_r)
-
-            # 8. Timing ───────────────────────────────────────────────────────
-            elapsed = time.perf_counter() - t0
-            if elapsed > dt * 1.2:
-                print(f"[Loop] Overrun tick {tick}: {elapsed*1000:.1f} ms "
-                      f"(budget {dt*1000:.0f} ms)")
-            time.sleep(max(0.0, dt - elapsed))
-
-    # ── Pretty print ──────────────────────────────────────────────────────────
-
-    def _print(self, t, tl, dtl, tlat, vw, ul, ulat, tw, tr):
-        print(
-            f"[t={t:6.1f}s] "
-            f"tl={math.degrees(tl):+6.2f}°  "
-            f"dtl={math.degrees(dtl):+6.1f}°/s  "
-            f"tlat={math.degrees(tlat):+6.2f}°  "
-            f"vw={vw:+.3f}  "
-            f"| u=({ul:+.3f},{ulat:+.3f}) Nm  "
-            f"tau_w={tw:+.3f}  tau_r={tr:+.3f} Nm"
-        )
-
-    # ── Graceful shutdown ─────────────────────────────────────────────────────
-
-    def _shutdown(self, sig=None, frame=None):
-        if not self._running:
+        # ── 2. Fall-stop ──────────────────────────────────────────────────────
+        fall = math.radians(cfg.FALL_DEG)
+        if abs(roll) > fall or abs(pitch) > fall:
+            self.robot.setTorque(0.0, 0.0)
+            if tick % cfg.PRINT_EVERY == 0:
+                print(f"\n[SAFETY] Fall detected — "
+                      f"roll={math.degrees(roll):.1f}°  "
+                      f"pitch={math.degrees(pitch):.1f}°  — MOTORS OFF")
             return
-        self._running = False
-        print("\n[Controller] Shutting down...")
+
+        # ── 3. Encoder readback ───────────────────────────────────────────────
+        try:
+            _, vel_w, _, vel_r = self.robot.readback()
+            self._last_vel_w = vel_w
+            self._last_vel_r = vel_r
+        except Exception:
+            vel_w = self._last_vel_w
+            vel_r = self._last_vel_r
+
+        # Motor wiring → axis velocities (paper §IV):
+        #   roll  axis velocity = motor id2 (wheel)
+        #   pitch axis velocity = motor id2 + motor id1 (roller coupling)
+        vel_roll_raw  = vel_w
+        vel_pitch_raw = vel_w + vel_r
+
+        # ── 4. EMA low-pass filters ───────────────────────────────────────────
+        a_ang  = cfg.EMA_ANG
+        a_rate = cfg.EMA_RATE
+        a_vel  = cfg.EMA_VEL
+
+        self._roll_filt      = a_ang  * self._roll_filt      + (1 - a_ang)  * roll
+        self._pitch_filt     = a_ang  * self._pitch_filt     + (1 - a_ang)  * pitch
+        self._rolldot_filt   = a_rate * self._rolldot_filt   + (1 - a_rate) * rolldot
+        self._pitchdot_filt  = a_rate * self._pitchdot_filt  + (1 - a_rate) * pitchdot
+        self._vel_roll_filt  = a_vel  * self._vel_roll_filt  + (1 - a_vel)  * vel_roll_raw
+        self._vel_pitch_filt = a_vel  * self._vel_pitch_filt + (1 - a_vel)  * vel_pitch_raw
+
+        roll_f      = self._roll_filt
+        pitch_f     = self._pitch_filt
+        rolldot_f   = self._rolldot_filt
+        pitchdot_f  = self._pitchdot_filt
+        vel_roll_f  = self._vel_roll_filt
+        vel_pitch_f = self._vel_pitch_filt
+
+        # ── 5. PID torque computation ─────────────────────────────────────────
+        tau_roll  = self.pid_roll.compute(roll_f,  rolldot_f,  vel_roll_f)
+        tau_pitch = self.pid_pitch.compute(pitch_f, pitchdot_f, vel_pitch_f)
+
+        # ── 6. Motor mixing (paper convention) ───────────────────────────────
+        #   motor id2 (wheel)  = roll torque
+        #   motor id1 (roller) = roll torque − pitch torque
+        tau_motor2 = tau_roll
+        tau_motor1 = tau_roll - tau_pitch
+
+        # Saturate
+        tau_motor2 = float(np.clip(tau_motor2, -cfg.MAX_TORQUE, cfg.MAX_TORQUE))
+        tau_motor1 = float(np.clip(tau_motor1, -cfg.MAX_TORQUE, cfg.MAX_TORQUE))
+
+        # Below noise floor → send zero (don't waste current on micro-commands)
+        if abs(tau_motor2) < cfg.MIN_TORQUE: tau_motor2 = 0.0
+        if abs(tau_motor1) < cfg.MIN_TORQUE: tau_motor1 = 0.0
+
+        # ── 7. Send to motors ─────────────────────────────────────────────────
+        # Omburo.setTorque(id_wheel=2, id_roller=1)
+        self.robot.setTorque(tau_motor2, tau_motor1)
+
+        # ── 8. Debug print (~10 Hz) ───────────────────────────────────────────
+        if tick % cfg.PRINT_EVERY == 0:
+            print(
+                f"\n"
+                f"  ROLL  (long): angle={math.degrees(roll_f):+6.2f}°  "
+                f"rate={math.degrees(rolldot_f):+6.2f}°/s  "
+                f"vel={vel_roll_f:+.3f} rad/s  "
+                f"τ_roll={tau_roll:+.4f} Nm\n"
+                f"  PITCH (lat) : angle={math.degrees(pitch_f):+6.2f}°  "
+                f"rate={math.degrees(pitchdot_f):+6.2f}°/s  "
+                f"vel={vel_pitch_f:+.3f} rad/s  "
+                f"τ_pitch={tau_pitch:+.4f} Nm\n"
+                f"  MOTORS      : id2(wheel)={tau_motor2:+.4f} Nm  "
+                f"id1(roller)={tau_motor1:+.4f} Nm",
+                flush=True
+            )
+
+    # ── Shutdown ───────────────────────────────────────────────────────────────
+
+    def _stop(self):
+        print("[Controller] Zeroing torques and disabling...")
         try:
             self.robot.setTorque(0.0, 0.0)
-            time.sleep(0.05)
+            time.sleep(0.1)
             self.robot.toggleTorque(0)
-        except Exception:
-            pass
-        try:
-            self.imu.disconnect()
         except Exception:
             pass
         try:
@@ -488,7 +606,6 @@ class OmBUROController:
         except Exception:
             pass
         print("[Controller] Done.")
-        sys.exit(0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -496,5 +613,5 @@ class OmBUROController:
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    controller = OmBUROController()
-    controller.start()
+    ctrl = OmBUROPIDController()
+    ctrl.run()

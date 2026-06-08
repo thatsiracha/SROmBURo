@@ -59,7 +59,7 @@ PITCHDOT_IDX = 1;  PITCHDOT_SIGN = -1.0  # ωy    → θ̇2                [inve
 
 # ── Safety & timing ───────────────────────────────────────────────────────────
 FALL_DEG = 30.0    # fall-stop threshold [deg]
-VEL_MAX  = 15.0    # motor velocity command saturation [rad/s]
+VEL_MAX  = 5.0    # motor velocity command saturation [rad/s]
 CTRL_HZ  = 150
 CTRL_DT  = 1.0 / CTRL_HZ
 

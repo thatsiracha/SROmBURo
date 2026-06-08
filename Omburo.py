@@ -16,7 +16,7 @@ class Omburo:
 
         # Set both motors to torque/current control mode.
         # PyBEAR examples use mode 1=velocity, 2=position, 3=torque/current.
-        self.bear.set_mode((id_wheel, 0),(id_roller, 0))
+        self.bear.set_mode((id_wheel, 1),(id_roller, 1))
 
         # Configure motor PID
         self.bear.set_p_gain_iq((id_wheel, 0.277),(id_roller, 0.277))

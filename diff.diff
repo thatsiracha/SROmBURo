@@ -1,0 +1,80 @@
+1,11c1
+< """
+< BEAR motor driver for SrOmBURo velocity-mode balancing.
+< 
+< Based on Omburo.py — dedicated to velocity control (mode 1).
+< Use this module from velocity-loop controllers (e.g. control2_Suraj.py).
+< 
+< setVelocity(vel_wheel, vel_roller):
+<     vel_wheel  → motor id2 (wheel)
+<     vel_roller → motor id1 (roller motor command)
+< """
+< 
+---
+> import time
+21,22c11
+< 
+< class OmburoVel:
+---
+> class Omburo:
+25c14
+< 
+---
+>         
+27,31d15
+<         self.id_wheel = id_wheel
+<         self.id_roller = id_roller
+< 
+<         # Velocity mode (1) for both motors.
+<         self.bear.set_mode((id_wheel, 1), (id_roller, 1))
+33,36c17,27
+<         # Motor inner-loop PID (iq current loop)
+<         self.bear.set_p_gain_iq((id_wheel, 0.277), (id_roller, 0.277))
+<         self.bear.set_i_gain_iq((id_wheel, 0.061), (id_roller, 0.061))
+<         self.bear.set_d_gain_iq((id_wheel, 0.0), (id_roller, 0.0))
+---
+>         # Set both motors to torque/current control mode.
+>         # PyBEAR examples use mode 1=velocity, 2=position, 0=torque/current, 3- Direct Force Mode.
+>         self.bear.set_mode((id_wheel, 1),(id_roller, 1))
+> 
+>         # Configure motor PID
+>         self.bear.set_p_gain_iq((id_wheel, 0.277),(id_roller, 0.277))
+>         self.bear.set_i_gain_iq((id_wheel, 0.061),(id_roller, 0.061))
+>         self.bear.set_d_gain_iq((id_wheel, 0.0),(id_roller, 0.0))
+>         self.bear.set_p_gain_iq((id_wheel, 0.277),(id_roller, 0.277))
+>         self.bear.set_i_gain_iq((id_wheel, 0.061),(id_roller, 0.061))
+>         self.bear.set_d_gain_iq((id_wheel, 0.0),(id_roller, 0.0))
+38c29
+<         self.bear.set_limit_i_max((id_wheel, 1.5), (id_roller, 1.5))
+---
+>         self.bear.set_limit_i_max((id_wheel, 1.5),(id_roller, 1.5))
+47c38,43
+<         self.bear.set_torque_enable((id_wheel, val), (id_roller, val))
+---
+>         self.bear.set_torque_enable((id_wheel, val),(id_roller, val))
+> 
+>     def setTorque(self, torque_wheel, torque_roller):
+>         iq_wheel = torque_wheel / kt
+>         iq_roller = torque_roller / kt
+>         self.bear.set_goal_iq((id_wheel, iq_wheel),(id_roller, iq_roller))
+50c46
+<         self.bear.set_limit_i_max((id_wheel, iq_max), (id_roller, iq_max))
+---
+>         self.bear.set_limit_i_max((id_wheel, iq_max),(id_roller, iq_max))
+53c49
+<         self.bear.set_mode((id_wheel, 1), (id_roller, 1))
+---
+>         self.bear.set_mode((id_wheel, 1),(id_roller, 1))
+56c52
+<         self.bear.set_mode((id_wheel, 0), (id_roller, 0))
+---
+>         self.bear.set_mode((id_wheel, 0),(id_roller, 0))
+59c55
+<         self.bear.set_goal_velocity((id_wheel, vel_wheel), (id_roller, vel_roller))
+---
+>         self.bear.set_goal_velocity((id_wheel, vel_wheel),(id_roller, vel_roller))
+62,63c58
+<         # Read back the current position and velocity of the motors.
+<         # Wheel velocity is negated to match the physical spin convention.
+---
+>         # Read back the current position and velocity of the motors

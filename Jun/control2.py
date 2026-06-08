@@ -381,7 +381,7 @@ class Controller:
         pitch_cmd = -(K21 * pitch + K22 * pitchdot + K23 * phi_pitchdot + K24 * self._phi_pitch_pos + KI_PITCH * self._pitch_int) * N_ROLLER
 
         # BEAR wiring mapping: id2 = roll_cmd, id1 = pitch_cmd - roll_cmd.
-        motor2_cmd = float(np.clip(roll_cmd_op, -VEL_MAX, VEL_MAX))
+        motor2_cmd = float(np.clip(pitch_cmd, -VEL_MAX, VEL_MAX))
         motor1_cmd = float(np.clip(pitch_cmd + roll_cmd, -VEL_MAX, VEL_MAX))
         self.robot.setVelocity(motor2_cmd, motor1_cmd)
         self._last_vw = motor2_cmd

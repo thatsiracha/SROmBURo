@@ -4,15 +4,17 @@ SrOmBURo velocity-loop balancing controller for Raspberry Pi
 Mirrors OmburoRev2 (Arduino/Dynamixel) control structure, adapted for
 BEAR actuators (pybear, rad/s output) and SrOmBURo physical parameters.
 
-Per-axis PD control law:
-    v_cmd = Kp·θ + Kd·θ̇ + Kφ̇·φ̇ + Kφ·φ_pos   [rad/s]
+Per-axis control law:
+    e       = ψ̇_ref − θ̇_body − φ̇              (velocity tracking error)
+    θ_ref   = θ_body − Kp·e − Ki·∫e dt          (PI station-keeping correction)
+    v_cmd   = K1·θ_ref + K2·θ̇_body + K3·φ̇ − H·ψ̇_ref   [rad/s]
 
 Motor output, matching the SrOmBURo BEAR wiring:
-    motor id2 (big wheel) = pitch_cmd          — corrects pitch (longitudinal)
-    motor id1 (roller)    = pitch_cmd + roll_cmd — differential roll correction
+    motor id2 = roll_cmd
+    motor id1 = pitch_cmd - roll_cmd
 
-OmburoVel.setVelocity() takes arguments in hardware order:
-    setVelocity(vel_wheel, vel_roller)
+Omburo.setVelocity() takes arguments in hardware order:
+    setVelocity(id2_cmd, id1_cmd)
 
 Gain starting values scaled from OmburoRev2:
     Dynamixel unit → rad/s  ×0.01194  (0.114 RPM/unit × 2π/60)
@@ -32,15 +34,15 @@ import serial
 from pybear import Manager
 
 sys.path.insert(0, "/home/omburo/Documents/SROmBURo")
-from OmburoVel import OmburoVel
+from Omburo import Omburo
 
 # ── Hardware ──────────────────────────────────────────────────────────────────
 IMU_PORT    = "/dev/ttyACM0"
 IMU_BAUD    = 115200
 IMU_RATE_HZ = 200          # must divide 500 evenly
 
-ID_WHEEL    = 2            # BEAR motor id2 (big wheel): receives pitch_cmd
-ID_ROLLER   = 1            # BEAR motor id1 (roller motor): receives pitch_cmd + roll_cmd
+ID_WHEEL    = 2            # BEAR motor id2: receives roll_cmd
+ID_ROLLER   = 1            # BEAR motor id1: receives pitch_cmd - roll_cmd
 
 # ── Physical parameters (SrOmBURo) ───────────────────────────────────────────
 R        = 0.101    # wheel radius [m]
@@ -50,31 +52,36 @@ N_ROLLER = 4.0      # roller gear coupling ratio (φ̇2 = N·(φ̇_w + φ̇_r))
 # ── IMU axis mapping ──────────────────────────────────────────────────────────
 # Matches OmburoRev2: euler[0]=roll (lateral θ1), euler[1]=pitch (longitudinal θ2)
 # Adjust signs for physical IMU mounting orientation.
-ROLL_EU_IDX  = 0;  ROLL_EU_SIGN  =  1.0   # roll  → θ1 (lateral)
+ROLL_EU_IDX  = 0;  ROLL_EU_SIGN  = 1.0   # roll  → θ1 (lateral)
 PITCH_EU_IDX = 1;  PITCH_EU_SIGN = -1.0  # pitch → θ2 (longitudinal)  [inverted: hw test confirmed]
 ROLLDOT_IDX  = 0;  ROLLDOT_SIGN  =  1.0  # ωx    → θ̇1
 PITCHDOT_IDX = 1;  PITCHDOT_SIGN = -1.0  # ωy    → θ̇2                [inverted: same axis as pitch]
 
 # ── Safety & timing ───────────────────────────────────────────────────────────
-FALL_DEG = 40.0    # fall-stop threshold [deg]
-VEL_MAX  = 50.0    # motor velocity command saturation [rad/s]
-CTRL_HZ  = 500
+FALL_DEG = 30.0    # fall-stop threshold [deg]
+VEL_MAX  = 5.0    # motor velocity command saturation [rad/s]
+CTRL_HZ  = 150
 CTRL_DT  = 1.0 / CTRL_HZ
 
 # ── Control gains ─────────────────────────────────────────────────────────────
 # Axis 1: roll correction, matching OmburoRev2 f1_goal
-K11 = 400.0   # roll angle gain
-K12 = 0.0   # rolldot gain
-K13 =  0.0   # φ̇ gain
-K14 =  0.0  # φ position gain (roll) — keep tiny
+K11 = 85.0   # roll angle gain
+K12 = 11.0   # rolldot gain
+K13 =  0.3   # φ̇ gain
+K14 =  0.03  # φ position gain (roll) — keep tiny
 H1  =  0.0   # feedforward — disabled
 
 # Axis 2: pitch correction, matching OmburoRev2 f2_goal
-K21 = 400.0   # pitch angle gain
-K22 =  0.0   # pitchdot gain
-K23 =  0.0   # φ̇ gain
-K24 =  0.0  # φ position gain (pitch) — keep tiny
+K21 = 70.0   # pitch angle gain
+K22 =  2.0   # pitchdot gain
+K23 =  0.3   # φ̇ gain
+K24 =  0.03  # φ position gain (pitch) — keep tiny
 H2  =  0.0   # feedforward — disabled
+
+# Angle integral (station keeping) — integrates angle directly, no phi coupling
+KI_PITCH = 2.0   # [rad/s per rad·s] — start small, increase if drift remains
+KI_ROLL  = 1.5
+INT_VEL_LIM = 3.0  # max integral contribution [rad/s], anti-windup
 
 # ── State measurement filter ──────────────────────────────────────────────────
 EMA_ALPHA_ANG  = 0.2    # angle  filter (~8 Hz cutoff @ 150 Hz)
@@ -222,11 +229,13 @@ def _imu_thread(state: IMUState):
 class Controller:
     def __init__(self):
         self.imu   = IMUState()
-        self.robot = OmburoVel()
+        self.robot = Omburo()
 
         self._vref1 = 0.0   # lateral   velocity reference [m/s]
         self._vref2 = 0.0   # longitudinal velocity reference [m/s]
 
+        self._pitch_int = 0.0  # angle integrals for station keeping
+        self._roll_int  = 0.0
         self._roll_offset  = 0.0  # set by _calibrate()
         self._pitch_offset = 0.0
 
@@ -259,6 +268,8 @@ class Controller:
             pitch_sum += PITCH_EU_SIGN * math.radians(euler[PITCH_EU_IDX])
         self._roll_offset  = roll_sum  / n
         self._pitch_offset = pitch_sum / n
+        self._pitch_int = 0.0
+        self._roll_int  = 0.0
         print(f"  roll offset={math.degrees(self._roll_offset):.2f}°  "
               f"pitch offset={math.degrees(self._pitch_offset):.2f}°")
 
@@ -355,12 +366,21 @@ class Controller:
         self._phi_pitch_pos += phi_pitchdot * CTRL_DT
         self._phi_roll_pos  += phi_rolldot  * CTRL_DT
 
-        # Axis 1, roll: OmburoRev2 f1_goal (PD).
-        roll_cmd = K11 * roll + K12 * rolldot + K13 * phi_rolldot + K14 * self._phi_roll_pos
-        # Axis 2, pitch: OmburoRev2 f2_goal (PD). Roller coupling scale on pitch axis.
-        pitch_cmd = -(K21 * pitch + K22 * pitchdot + K23 * phi_pitchdot + K24 * self._phi_pitch_pos) * N_ROLLER
+        # Angle integral — station keeping (anti-windup via velocity contribution limit)
+        int_max = INT_VEL_LIM / max(KI_PITCH, 1e-6)
+        self._pitch_int = float(np.clip(
+            self._pitch_int + pitch * CTRL_DT, -int_max, int_max))
+        int_max_r = INT_VEL_LIM / max(KI_ROLL, 1e-6)
+        self._roll_int = float(np.clip(
+            self._roll_int + roll * CTRL_DT, -int_max_r, int_max_r))
 
-        # BEAR wiring: id2 (big wheel) = pitch_cmd; id1 (roller) = pitch_cmd + roll_cmd.
+        # Axis 1, roll: OmburoRev2 f1_goal.
+        roll_cmd = K11 * roll + K12 * rolldot + K13 * phi_rolldot + K14 * self._phi_roll_pos + KI_ROLL * self._roll_int
+        roll_cmd_op = -roll_cmd
+        # Axis 2, pitch: OmburoRev2 f2_goal. The roller coupling scale belongs here.
+        pitch_cmd = -(K21 * pitch + K22 * pitchdot + K23 * phi_pitchdot + K24 * self._phi_pitch_pos + KI_PITCH * self._pitch_int) * N_ROLLER
+
+        # BEAR wiring mapping: id2 = roll_cmd, id1 = pitch_cmd - roll_cmd.
         motor2_cmd = float(np.clip(pitch_cmd, -VEL_MAX, VEL_MAX))
         motor1_cmd = float(np.clip(pitch_cmd + roll_cmd, -VEL_MAX, VEL_MAX))
         self.robot.setVelocity(motor2_cmd, motor1_cmd)
@@ -373,6 +393,8 @@ class Controller:
                 f"\n"
                 f"  angle : roll={math.degrees(roll):+6.2f}°  pitch={math.degrees(pitch):+6.2f}°\n"
                 f"  rate  : rdot={rolldot:+5.2f}  pdot={pitchdot:+5.2f}  rad/s\n"
+                f"  integ : pitch_i={KI_PITCH * self._pitch_int:+5.3f}  "
+                f"roll_i={KI_ROLL * self._roll_int:+5.3f}  rad/s\n"
                 f"  axis  : pitch_cmd={pitch_cmd:+6.2f}  roll_cmd={roll_cmd:+6.2f}  rad/s\n"
                 f"  motor : id2={motor2_cmd:+6.2f}  id1={motor1_cmd:+6.2f}  rad/s",
                 flush=True

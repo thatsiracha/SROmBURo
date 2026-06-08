@@ -34,9 +34,11 @@ import time
 
 import numpy as np
 import serial
+from pybear import Manager
 
 sys.path.insert(0, "/home/omburo/Documents/SROmBURo")
 from Omburo import Omburo
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -60,23 +62,23 @@ class Config:
     # Paper convention (confirmed by hardware test):
     #   roll  (longitudinal, θ₁) = euler[1], sign = -1
     #   pitch (lateral,      θ₂) = euler[0], sign = +1
-    ROLL_EU_IDX   = 1;  ROLL_EU_SIGN   = -1.0   # longitudinal — was PITCH
-    PITCH_EU_IDX  = 0;  PITCH_EU_SIGN  =  1.0   # lateral      — was ROLL
+    ROLL_EU_IDX   = 1;  ROLL_EU_SIGN   = 1.0   # longitudinal — was PITCH
+    PITCH_EU_IDX  = 0;  PITCH_EU_SIGN  =  -1.0   # lateral      — was ROLL
 
     ROLLDOT_IDX   = 1;  ROLLDOT_SIGN   = -1.0   # ωy → θ̇₁ (longitudinal rate)
     PITCHDOT_IDX  = 0;  PITCHDOT_SIGN  =  1.0   # ωx → θ̇₂ (lateral rate)
 
     # ── PID gains — ROLL axis (longitudinal, forward/backward) ───────────────
-    KP_ROLL  = 15.0   # Nm/rad
+    KP_ROLL  = 1.0   # Nm/rad
     KI_ROLL  =  0.0   # Nm/(rad·s) — start at 0, add slowly
     KD_ROLL  =  0.3   # Nm·s/rad   (uses gyro directly, not finite diff)
-    KV_ROLL  =  0.5   # Nm/(rad/s) — wheel velocity damping
+    KV_ROLL  =  0.01   # Nm/(rad/s) — wheel velocity damping
 
     # ── PID gains — PITCH axis (lateral, side-to-side) ───────────────────────
-    KP_PITCH = 15.0
+    KP_PITCH = 1.0
     KI_PITCH =  0.0
     KD_PITCH =  0.3
-    KV_PITCH =  0.5
+    KV_PITCH =  0.005
 
     # ── Integrator anti-windup ────────────────────────────────────────────────
     INT_CAP_ROLL  = 0.3   # Nm — max integral contribution
@@ -84,8 +86,8 @@ class Config:
 
     # ── Safety ────────────────────────────────────────────────────────────────
     FALL_DEG     = 40.0   # cut motors if tilt exceeds this [deg]
-    MAX_TORQUE   = 0.5    # Nm per motor (BEAR limit: 1.5 A × kt 0.35 = 0.525 Nm)
-    MIN_TORQUE   = 0.05   # Nm — below this motors don't move; send 0
+    MAX_TORQUE   = 1.5    # Nm per motor (BEAR limit: 1.5 A × kt 0.35 = 0.525 Nm)
+    MIN_TORQUE   = 0.005   # Nm — below this motors don't move; send 0
 
     # ── EMA low-pass filter coefficients ─────────────────────────────────────
     # Higher α → more smoothing → more lag. Tune for noise/responsiveness.
@@ -339,6 +341,8 @@ class OmBUROPIDController:
     """
 
     def __init__(self):
+        from pybear import Manager
+
         self.cfg   = Config()
         self.imu   = IMUState()
         self.robot = Omburo()
@@ -398,8 +402,12 @@ class OmBUROPIDController:
         # Calibrate static offsets
         self._calibrate()
 
+        #Turns on torque for motors
         self.robot.toggleTorque(1)
         time.sleep(0.2)
+
+        #Sets motor to torque mode (0)
+        self.robot.setTorqueMode()
 
         print(f"\n[Init] Loop rate : {self.cfg.CTRL_HZ} Hz")
         print(f"[Init] KP_ROLL={self.cfg.KP_ROLL}  KD_ROLL={self.cfg.KD_ROLL}  "
@@ -573,6 +581,7 @@ class OmBUROPIDController:
         # ── 7. Send to motors ─────────────────────────────────────────────────
         # Omburo.setTorque(id_wheel=2, id_roller=1)
         self.robot.setTorque(tau_motor2, tau_motor1)
+        
 
         # ── 8. Debug print (~10 Hz) ───────────────────────────────────────────
         if tick % cfg.PRINT_EVERY == 0:

@@ -568,7 +568,7 @@ class OmBUROPIDController:
         #   motor id2 (wheel)  = roll torque
         #   motor id1 (roller) = roll torque − pitch torque
         tau_motor2 = tau_roll + (tau_pitch / 4) # where 8 is the gear ratio N_ROLLER 
-        tau_motor1 = tau_pitch
+        tau_motor1 = 0
 
         # Saturate
         tau_motor2 = float(np.clip(tau_motor2, -cfg.MAX_TORQUE, cfg.MAX_TORQUE))

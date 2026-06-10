@@ -51,7 +51,7 @@ class Config:
     # Ports
     IMU_PORT    = "/dev/ttyACM0"
     IMU_BAUD    = 115200
-    IMU_RATE_HZ = 200          # IMU sample rate — must divide 500 evenly
+    IMU_RATE_HZ = 500         # IMU sample rate — synced 1:1 with control loop
 
     # Loop
     CTRL_HZ = 500
@@ -71,14 +71,14 @@ class Config:
     PITCHDOT_IDX  = 0;  PITCHDOT_SIGN  =  1.0   # ωx → θ̇₂ (lateral rate)
 
     # ── PID gains — ROLL axis (longitudinal, forward/backward) ───────────────
-    KP_ROLL  =  50.0   # Nm/rad
-    KI_ROLL  =  0.1   # Nm/(rad·s) — start at 0, add slowly
+    KP_ROLL  =  45.0   # Nm/rad
+    KI_ROLL  =  0.05   # Nm/(rad·s) — start at 0, add slowly
     KD_ROLL  =  2.0   # Nm·s/rad   (uses gyro directly, not finite diff)
     KV_ROLL  =  0.0   # Nm/(rad/s) — wheel velocity damping
 
     # ── PID gains — PITCH axis (lateral, side-to-side) ───────────────────────
-    KP_PITCH =  50.0
-    KI_PITCH =  0.1
+    KP_PITCH =  45.0
+    KI_PITCH =  0.05
     KD_PITCH =  2.0
     KV_PITCH =  0.0
 
@@ -88,7 +88,7 @@ class Config:
 
     # ── Safety ────────────────────────────────────────────────────────────────
     FALL_DEG     = 40.0   # cut motors if tilt exceeds this [deg]
-    MAX_TORQUE   = 2.0    # Nm per motor (BEAR limit: 1.5 A × kt 0.35 = 0.525 Nm)
+    MAX_TORQUE   = 2.1    # Nm per motor (BEAR limit: 1.5 A × kt 0.35 = 0.525 Nm)
     MIN_TORQUE   = 0.00   # Nm — below this motors don't move; send 0
 
     # ── EMA low-pass filter coefficients ─────────────────────────────────────
@@ -97,15 +97,21 @@ class Config:
     EMA_RATE = 0.0   # gyro rate
     EMA_VEL  = 0.15   # wheel velocity (encoder noisier than gyro)
 
-    # ── Outer position loop (50 Hz within 500 Hz inner loop) ─────────────────
+    # ── Outer position loop (500 Hz inner loop) ─────────────────
     OUTER_LOOP_DIVISOR = 1
-    KP_POSITION        = 0.015
+    KP_POSITION        = 0.013
     KD_POSITION        = 0.0
     MAX_TARGET_ANGLE   = 0.05   # rad (~5.7°) — clamp outer-loop lean command
-    MAX_ANGLE_RATE = 0.25  # Max change of 0.25 rad (~14.3 degrees) per second
+    MAX_ANGLE_RATE = 0.3  # Max change of 0.25 rad (~14.3 degrees) per second
 
     # ── Calibration ───────────────────────────────────────────────────────────
     CALIB_SAMPLES = 100   # IMU samples to average for offset
+
+    # ── IMU connect reliability ─────────────────────────────────────────────────
+    IMU_CONNECT_RETRIES = 5    # full setup attempts before giving up
+    IMU_INIT_WAIT_SEC   = 15.0 # max wait for first valid packet
+    IMU_DRAIN_SEC       = 0.5  # discard leftover stream bytes after stop
+    IMU_ACK_RETRIES     = 5    # per-command ACK attempts
 
     # ── Debug ─────────────────────────────────────────────────────────────────
     PRINT_EVERY = 50   # print every N control ticks (~10 Hz at 500 Hz)
@@ -176,9 +182,21 @@ def _read_mip_packet(ser: serial.Serial,
             return pkt[2], pkt[4: 4 + plen]
     return None
 
+def _drain_serial(ser: serial.Serial, duration: float) -> None:
+    """Read and discard inbound bytes (clears a leftover IMU stream flood)."""
+    deadline = time.time() + duration
+    while time.time() < deadline:
+        waiting = ser.in_waiting
+        if waiting:
+            ser.read(waiting)
+        else:
+            time.sleep(0.01)
+
+
 def _imu_ack(ser: serial.Serial, pkt: bytes,
-             cmd_desc: int, retries: int = 3) -> bool:
-    for _ in range(retries):
+             cmd_desc: int, retries: int = 3, label: str = "") -> bool:
+    tag = f" ({label})" if label else ""
+    for attempt in range(1, retries + 1):
         ser.reset_input_buffer()
         ser.write(pkt)
         deadline = time.time() + 1.5
@@ -192,7 +210,43 @@ def _imu_ack(ser: serial.Serial, pkt: bytes,
             if len(pl) >= 4 and pl[1] == 0xF1:
                 if pl[2] == cmd_desc and pl[3] == 0x00:
                     return True
+                print(f"[IMU] NACK{tag}: echo=0x{pl[2]:02X} err=0x{pl[3]:02X} "
+                      f"(attempt {attempt}/{retries})")
                 break
+        else:
+            print(f"[IMU] No ACK{tag} (attempt {attempt}/{retries})")
+    return False
+
+
+def _imu_setup(ser: serial.Serial, cfg: Config) -> bool:
+    """Stop any old stream, ping, configure format, and start streaming."""
+    for attempt in range(1, cfg.IMU_CONNECT_RETRIES + 1):
+        print(f"[IMU] Setup attempt {attempt}/{cfg.IMU_CONNECT_RETRIES}...")
+        _imu_ack(ser, _cmd_imu_stream(False), 0x11,
+                 retries=cfg.IMU_ACK_RETRIES, label="stop stream")
+        time.sleep(0.15)
+        _drain_serial(ser, cfg.IMU_DRAIN_SEC)
+        ser.reset_input_buffer()
+
+        if not _imu_ack(ser, _cmd_ping(), 0x01,
+                        retries=cfg.IMU_ACK_RETRIES, label="ping"):
+            time.sleep(0.4 * attempt)
+            continue
+
+        if not _imu_ack(ser,
+                        _cmd_imu_format(cfg.IMU_RATE_HZ,
+                                        [FIELD_EULER, FIELD_GYRO]), 0x08,
+                        retries=cfg.IMU_ACK_RETRIES, label="format"):
+            time.sleep(0.4 * attempt)
+            continue
+
+        if not _imu_ack(ser, _cmd_imu_stream(True), 0x11,
+                        retries=cfg.IMU_ACK_RETRIES, label="start stream"):
+            time.sleep(0.4 * attempt)
+            continue
+
+        return True
+
     return False
 
 def _parse_imu_payload(payload: bytes) -> tuple:
@@ -224,53 +278,79 @@ class IMUState:
         self.euler   = (0.0, 0.0, 0.0)   # (roll_deg, pitch_deg, yaw_deg)
         self.gyro    = (0.0, 0.0, 0.0)   # (ωx, ωy, ωz) rad/s
         self.updated = threading.Event()
+        self.failed  = threading.Event()
+        self.error_msg = ""
 
     def push(self, euler=None, gyro=None):
+        if euler is None:
+            return
         with self._lock:
-            if euler is not None: self.euler = euler
-            if gyro  is not None: self.gyro  = gyro
+            self.euler = euler
+            if gyro is not None:
+                self.gyro = gyro
         self.updated.set()
+
+    def fail(self, msg: str):
+        self.error_msg = msg
+        self.failed.set()
 
     def get(self) -> tuple:
         with self._lock:
-            return self.euler, self.gyro
+            euler = self.euler
+            gyro = self.gyro
+        return euler, gyro
 
 
-def _imu_reader_thread(state: IMUState, cfg: Config):
+def _imu_reader_thread(state: IMUState, cfg: Config,
+                       stop_event: threading.Event):
     """Runs in a daemon thread. Reconnects automatically on serial errors."""
+    if not os.path.exists(cfg.IMU_PORT):
+        msg = f"Port {cfg.IMU_PORT} not found — is the IMU plugged in?"
+        print(f"[IMU] {msg}")
+        state.fail(msg)
+        return
+
     try:
         with serial.Serial(cfg.IMU_PORT, cfg.IMU_BAUD,
                            timeout=0.05, dsrdtr=False, rtscts=False) as ser:
-            time.sleep(1.5)
-            ser.reset_input_buffer()
+            try:
+                time.sleep(1.5)
+                ser.reset_input_buffer()
 
-            if not _imu_ack(ser, _cmd_ping(), 0x01):
-                print("[IMU] No ping response — check cable and power"); return
+                if not _imu_setup(ser, cfg):
+                    msg = "Setup failed after all retries — check cable and power"
+                    print(f"[IMU] {msg}")
+                    state.fail(msg)
+                    return
 
-            _imu_ack(ser, _cmd_imu_stream(False), 0x11)   # stop any old stream
-            time.sleep(0.1); ser.reset_input_buffer()
+                print("[IMU] Stream active")
+                while not stop_event.is_set():
+                    r = _read_mip_packet(ser, timeout=0.1)
+                    if r is None:
+                        continue
+                    ds, pl = r
+                    if ds != DESC_IMU:
+                        continue
+                    euler, gyro = _parse_imu_payload(pl)
+                    state.push(euler=euler, gyro=gyro)
 
-            if not _imu_ack(ser,
-                            _cmd_imu_format(cfg.IMU_RATE_HZ,
-                                            [FIELD_EULER, FIELD_GYRO]), 0x08):
-                print("[IMU] Format config failed"); return
+            finally:
+                try:
+                    _drain_serial(ser, 0.1)
+                    _imu_ack(ser, _cmd_imu_stream(False), 0x11,
+                             retries=cfg.IMU_ACK_RETRIES, label="stop stream")
+                    print("[IMU] Stream stopped")
+                except Exception:
+                    pass
 
-            if not _imu_ack(ser, _cmd_imu_stream(True), 0x11):
-                print("[IMU] Stream enable failed"); return
-
-            print("[IMU] Stream active")
-            while True:
-                r = _read_mip_packet(ser, timeout=0.5)
-                if r is None:
-                    continue
-                ds, pl = r
-                if ds != DESC_IMU:
-                    continue
-                euler, gyro = _parse_imu_payload(pl)
-                state.push(euler=euler, gyro=gyro)
-
+    except serial.SerialException as exc:
+        msg = f"Serial error on {cfg.IMU_PORT}: {exc}"
+        print(f"[IMU] {msg}")
+        state.fail(msg)
     except Exception as exc:
-        print(f"[IMU] Thread error: {exc}")
+        msg = f"Thread error: {exc}"
+        print(f"[IMU] {msg}")
+        state.fail(msg)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -356,7 +436,9 @@ class OmBUROPIDController:
 
         self.cfg   = Config()
         self.imu   = IMUState()
-        self.robot = Omburo()
+        self.robot = None
+        self._imu_stop = threading.Event()
+        self._imu_thread = None
 
         self.pid_roll  = PIDTorque(
             kp=self.cfg.KP_ROLL,  ki=self.cfg.KI_ROLL,
@@ -406,14 +488,46 @@ class OmBUROPIDController:
         print("  Axes: roll=longitudinal(θ₁)  pitch=lateral(θ₂)")
         print("=" * 60)
 
-        # Start IMU background thread
-        t = threading.Thread(target=_imu_reader_thread,
-                             args=(self.imu, self.cfg), daemon=True)
-        t.start()
+        # Start IMU background thread (before BEAR init to avoid USB contention)
+        self._imu_stop.clear()
+        self.imu.updated.clear()
+        self.imu.failed.clear()
+        self.imu.error_msg = ""
+        if self._imu_thread is not None and self._imu_thread.is_alive():
+            self._imu_stop.set()
+            self._imu_thread.join(timeout=2.0)
+            self._imu_stop.clear()
 
-        print("[Init] Waiting for first IMU packet...")
-        if not self.imu.updated.wait(timeout=8.0):
-            print("[ERROR] IMU did not respond in 8 s — check cable"); return
+        self._imu_thread = threading.Thread(
+            target=_imu_reader_thread,
+            args=(self.imu, self.cfg, self._imu_stop),
+            daemon=True,
+        )
+        self._imu_thread.start()
+
+        print(f"[Init] Waiting for first IMU packet (up to {self.cfg.IMU_INIT_WAIT_SEC:.0f} s)...")
+        deadline = time.time() + self.cfg.IMU_INIT_WAIT_SEC
+        imu_ok = False
+        while time.time() < deadline:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            wait_slice = min(0.2, remaining)
+            if self.imu.failed.wait(timeout=wait_slice):
+                print(f"[ERROR] {self.imu.error_msg}")
+                self._stop()
+                return
+            if self.imu.updated.is_set():
+                imu_ok = True
+                break
+
+        if not imu_ok:
+            print(f"[ERROR] IMU did not respond in {self.cfg.IMU_INIT_WAIT_SEC:.0f} s — check cable")
+            self._stop()
+            return
+
+        print("[Init] Connecting to BEAR motors...")
+        self.robot = Omburo()
 
         # Switch to torque/current control mode
         self._set_torque_mode()
@@ -551,9 +665,15 @@ class OmBUROPIDController:
         # ── 3. Encoder readback ───────────────────────────────────────────────
         try:
             _, vel_w, _, vel_r = self.robot.readback()
-            if vel_w is None or vel_r is None:
+            if vel_w is None:
                 vel_w = self._last_vel_w
+            else:
+                self._last_vel_w = vel_w
+
+            if vel_r is None:
                 vel_r = self._last_vel_r
+            else:
+                self._last_vel_r = vel_r
         except Exception:
             vel_w = self._last_vel_w
             vel_r = self._last_vel_r
@@ -658,16 +778,21 @@ class OmBUROPIDController:
 
     def _stop(self):
         print("[Controller] Zeroing torques and disabling...")
-        try:
-            self.robot.setTorque(0.0, 0.0)
-            time.sleep(0.1)
-            self.robot.toggleTorque(0)
-        except Exception:
-            pass
-        try:
-            self.robot.close()
-        except Exception:
-            pass
+        if self.robot is not None:
+            try:
+                self.robot.setTorque(0.0, 0.0)
+                time.sleep(0.1)
+                self.robot.toggleTorque(0)
+            except Exception:
+                pass
+        self._imu_stop.set()
+        if self._imu_thread is not None and self._imu_thread.is_alive():
+            self._imu_thread.join(timeout=2.0)
+        if self.robot is not None:
+            try:
+                self.robot.close()
+            except Exception:
+                pass
         print("[Controller] Done.")
 
 
@@ -677,4 +802,8 @@ class OmBUROPIDController:
 
 if __name__ == "__main__":
     ctrl = OmBUROPIDController()
-    ctrl.run()
+    try:
+        ctrl.run()
+    except KeyboardInterrupt:
+        print("\n[Controller] Interrupted during startup...")
+        ctrl._stop()

@@ -102,6 +102,7 @@ class Config:
     KP_POSITION        = 0.01
     KD_POSITION        = 0.0
     MAX_TARGET_ANGLE   = 0.05   # rad (~5.7°) — clamp outer-loop lean command
+    MAX_ANGLE_RATE = 0.25  # Max change of 0.25 rad (~14.3 degrees) per second
 
     # ── Calibration ───────────────────────────────────────────────────────────
     CALIB_SAMPLES = 100   # IMU samples to average for offset
@@ -585,19 +586,24 @@ class OmBUROPIDController:
         vel_pitch_f = self._vel_pitch_filt
 
         # ── 4b. Outer position loop (50 Hz) ───────────────────────────────────
-        if tick % cfg.OUTER_LOOP_DIVISOR == 0:
-            err_pos_roll  = self.target_pos_roll  - self.pos_roll
-            err_pos_pitch = self.target_pos_pitch - self.pos_pitch
+        
+        # 1. Calculate the raw desired target angle from the outer PD loop
+        desired_roll  = (cfg.KP_POSITION * err_pos_roll)  - (cfg.KD_POSITION * vel_roll_f)
+        desired_pitch = (cfg.KP_POSITION * err_pos_pitch) - (cfg.KD_POSITION * vel_pitch_f)
 
-            self.cmd_angle_roll  = (cfg.KP_POSITION * err_pos_roll
-                                    - cfg.KD_POSITION * vel_roll_f)
-            self.cmd_angle_pitch = (cfg.KP_POSITION * err_pos_pitch
-                                    - cfg.KD_POSITION * vel_pitch_f)
+        # 2. Clamp the desired angles to our absolute safety ceiling
+        desired_roll  = max(-cfg.MAX_TARGET_ANGLE, min(desired_roll,  cfg.MAX_TARGET_ANGLE))
+        desired_pitch = max(-cfg.MAX_TARGET_ANGLE, min(desired_pitch, cfg.MAX_TARGET_ANGLE))
 
-        self.cmd_angle_roll  = max(-cfg.MAX_TARGET_ANGLE,
-                                   min(self.cmd_angle_roll,  cfg.MAX_TARGET_ANGLE))
-        self.cmd_angle_pitch = max(-cfg.MAX_TARGET_ANGLE,
-                                   min(self.cmd_angle_pitch, cfg.MAX_TARGET_ANGLE))
+        # 3. Calculate the maximum amount the angle is allowed to change in a single 2ms tick
+        max_change_per_tick = cfg.MAX_ANGLE_RATE * cfg.CTRL_DT
+
+        # 4. Apply the Slew Rate Limit (only move toward the desired angle by the max allowed step)
+        diff_roll  = desired_roll  - self.cmd_angle_roll
+        diff_pitch = desired_pitch - self.cmd_angle_pitch
+
+        self.cmd_angle_roll  += max(-max_change_per_tick, min(diff_roll,  max_change_per_tick))
+        self.cmd_angle_pitch += max(-max_change_per_tick, min(diff_pitch, max_change_per_tick))
 
         # ── 5. PID torque computation ─────────────────────────────────────────
         tau_roll  = self.pid_roll.compute(roll_f,  rolldot_f,  vel_roll_f,

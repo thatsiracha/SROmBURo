@@ -2,41 +2,43 @@
 SrOmBURo PID Torque Controller — Raspberry Pi
 Uses: MicrostrainIMU (microstrain_imu.py) + Omburo (Omburo.py)
 
-Axis and motor direction convention follows control2_Suraj.py:
-    roll  — lateral tilt,      euler[0], sign +1
-    pitch — longitudinal tilt, euler[1], sign -1
+Naming convention matches the OmBURo paper (Shen & Hong, arXiv:2001.07856):
+    roll  (θ₁) — longitudinal tilt, forward/backward — motor id2 (wheel)
+    pitch (θ₂) — lateral tilt,      side-to-side      — motor id1 (roller)
+
+Note: this is the OPPOSITE of standard robotics convention but matches
+the paper. The previous code had these swapped.
 
 Control law per axis:
-    error    = 0 − angle                          (want upright = 0 rad)
+    outer (50 Hz): cmd_angle = Kp_pos·pos_err − Kd_pos·wheel_vel
+    inner (500 Hz): error = cmd_angle − angle
     integral += error · dt                        (anti-windup clamped)
     torque   = Kp·error + Ki·integral + Kd·rate + Kv·wheel_velocity
 
-Motor output, matching control2_Suraj.py:
-    motor id2 torque = pitch_torque
-    motor id1 torque = roll_torque
+Motor mixing (from paper §IV, BEAR wiring):
+    motor id2 torque = roll_torque
+    motor id1 torque = roll_torque − pitch_torque
 
 Tuning order:
-    1. KP_ROLL = 10, KD_ROLL = 0.2, KI_ROLL = 0  — get lateral balance
-    2. KP_PITCH = 10, KD_PITCH = 0.2, KI_PITCH = 0 — get longitudinal balance
+    1. KP_ROLL = 10, KD_ROLL = 0.2, KI_ROLL = 0  — get longitudinal balance
+    2. KP_PITCH = 10, KD_PITCH = 0.2, KI_PITCH = 0 — get lateral balance
     3. Raise KP until it resists tipping, raise KD to kill oscillation
     4. Add KI (0.1–0.5) only once KP/KD are stable
     5. Add KV (0.2–1.0) to prevent runaway wheel spin
 """
 
-import csv
 import math
-import os
 import struct
 import sys
-import termios
 import threading
 import time
-import tty
+import os
 
+import numpy as np
 import serial
 from pybear import Manager
 
-sys.path.insert(0, "/home/omburo/Documents/SROmBURo")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from Omburo import Omburo
 
 
@@ -49,34 +51,35 @@ class Config:
     # Ports
     IMU_PORT    = "/dev/ttyACM0"
     IMU_BAUD    = 115200
-    IMU_RATE_HZ = 500         # IMU sample rate — synced 1:1 with control loop
+    IMU_RATE_HZ = 200          # IMU sample rate — must divide 500 evenly
 
     # Loop
     CTRL_HZ = 500
     CTRL_DT = 1.0 / CTRL_HZ
-    COMMAND_RAMP_SEC = 3.0   # linearly ramp motor commands after SPACE start
 
     # Physical
     N_ROLLER = 4.0   # roller gear coupling (φ̇₂ = N·(φ̇_wheel + φ̇_roller))
 
     # ── IMU axis mapping ──────────────────────────────────────────────────────
-    # Matches control2_Suraj.py: roll=euler[0](+), pitch=euler[1](-).
-    ROLL_EU_IDX   = 0;  ROLL_EU_SIGN   =  1.0   # roll  → lateral axis
-    PITCH_EU_IDX  = 1;  PITCH_EU_SIGN  = -1.0   # pitch → longitudinal axis
+    # Paper convention (confirmed by hardware test):
+    #   roll  (longitudinal, θ₁) = euler[1], sign = -1
+    #   pitch (lateral,      θ₂) = euler[0], sign = +1
+    ROLL_EU_IDX   = 1;  ROLL_EU_SIGN   =  -1.0   # longitudinal — was PITCH
+    PITCH_EU_IDX  = 0;  PITCH_EU_SIGN  =  1.0   # lateral      — was ROLL
 
-    ROLLDOT_IDX   = 0;  ROLLDOT_SIGN   =  1.0   # ωx → roll rate
-    PITCHDOT_IDX  = 1;  PITCHDOT_SIGN  = -1.0   # ωy → pitch rate
+    ROLLDOT_IDX   = 1;  ROLLDOT_SIGN   = -1.0   # ωy → θ̇₁ (longitudinal rate)
+    PITCHDOT_IDX  = 0;  PITCHDOT_SIGN  =  1.0   # ωx → θ̇₂ (lateral rate)
 
-    # ── PID gains — ROLL axis (lateral, side-to-side) ─────────────────────────
-    KP_ROLL  = 0.0   # Nm/rad
-    KI_ROLL  = 0.0   # Nm/(rad·s) — start at 0, add slowly
-    KD_ROLL  = 0.0   # Nm·s/rad   (uses gyro directly, not finite diff)
+    # ── PID gains — ROLL axis (longitudinal, forward/backward) ───────────────
+    KP_ROLL  =  50.0   # Nm/rad
+    KI_ROLL  =  0.1   # Nm/(rad·s) — start at 0, add slowly
+    KD_ROLL  =  2.5   # Nm·s/rad   (uses gyro directly, not finite diff)
     KV_ROLL  =  0.0   # Nm/(rad/s) — wheel velocity damping
 
-    # ── PID gains — PITCH axis (longitudinal, forward/backward) ───────────────
-    KP_PITCH = 0.0
-    KI_PITCH = 0.0
-    KD_PITCH = 0.0
+    # ── PID gains — PITCH axis (lateral, side-to-side) ───────────────────────
+    KP_PITCH =  50.0
+    KI_PITCH =  0.1
+    KD_PITCH =  2.5
     KV_PITCH =  0.0
 
     # ── Integrator anti-windup ────────────────────────────────────────────────
@@ -85,49 +88,26 @@ class Config:
 
     # ── Safety ────────────────────────────────────────────────────────────────
     FALL_DEG     = 40.0   # cut motors if tilt exceeds this [deg]
-    MAX_TORQUE   = 2.2    # Nm per motor (BEAR limit: 6.3 A × kt 0.35 = 0.525 Nm)
+    MAX_TORQUE   = 2.0    # Nm per motor (BEAR limit: 1.5 A × kt 0.35 = 0.525 Nm)
     MIN_TORQUE   = 0.00   # Nm — below this motors don't move; send 0
 
     # ── EMA low-pass filter coefficients ─────────────────────────────────────
-    # Set to 0.0 to bypass EMA: filtered = raw.
-    EMA_ANG  = 0.0    # angle
-    EMA_RATE = 0.0    # gyro rate
-    EMA_VEL  = 0.0    # wheel velocity
+    # Higher α → more smoothing → more lag. Tune for noise/responsiveness.
+    EMA_ANG  = 0.0   # angle  (~8 Hz cutoff at 500 Hz loop)
+    EMA_RATE = 0.0   # gyro rate
+    EMA_VEL  = 0.15   # wheel velocity (encoder noisier than gyro)
+
+    # ── Outer position loop (50 Hz within 500 Hz inner loop) ─────────────────
+    OUTER_LOOP_DIVISOR = 1
+    KP_POSITION        = 0.01
+    KD_POSITION        = 0.0
+    MAX_TARGET_ANGLE   = 0.05   # rad (~5.7°) — clamp outer-loop lean command
 
     # ── Calibration ───────────────────────────────────────────────────────────
     CALIB_SAMPLES = 100   # IMU samples to average for offset
 
-    # ── Feedforward Parameters (Gravity & Friction) ───────────────────────────
-    # Gravity FF uses the above-axis body mass m_b, not total robot mass.
-    M_TOTAL = 3.04       # [kg] total robot mass, reference only
-    G_ACCEL = 9.81       # [m/s²]
-    M_BODY = 2.42        # [kg] above-axis body mass m_b
-    M_WHEEL = 0.620      # [kg] wheel/axis mass m_w
-    L_COM_ROLL = 0.7348  # [m] roll-axis to body COM
-    L_COM_PITCH = 0.647  # [m] pitch-axis to body COM
-    R_ROLL = 0.0142      # [m] roll drive radius
-    R_PITCH = 0.102      # [m] pitch drive radius
-    R_DRIVE_ROLL = R_ROLL / N_ROLLER  # [m] effective roll radius through roller gear
-    R_DRIVE_PITCH = R_PITCH           # [m] pitch direct-drive effective radius
-
-    I_W_ROLL = 0.0       # [kg·m²] roller inertia ignored; TODO: replace if measured
-    I_W_PITCH = 0.0030   # [kg·m²] pitch wheel inertia
-
-    M_EFF_ROLL = M_BODY + M_WHEEL + I_W_ROLL / (R_DRIVE_ROLL**2)
-    M_EFF_PITCH = 3.33   # [kg] = M_BODY + M_WHEEL + I_W_PITCH / R_PITCH²
-    MGL_BODY_ROLL = M_BODY * G_ACCEL * L_COM_ROLL
-    MGL_BODY_PITCH = M_BODY * G_ACCEL * L_COM_PITCH
-
-    # Coulomb Friction
-    FRIC_ROLL  = 0.5  # Nm
-    FRIC_PITCH = 0.3  # Nm
-
-    # tanh 마찰 보상 스케일 (클수록 sign에 가까움, 작을수록 부드러움)
-    FRIC_TANH_SCALE = 20.0   # 1/(rad/s)
-
     # ── Debug ─────────────────────────────────────────────────────────────────
-    PRINT_EVERY = 50   # print every N control ticks (~1 Hz at 500 Hz)
-    DEBUG_CSV = True
+    PRINT_EVERY = 50   # print every N control ticks (~10 Hz at 500 Hz)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -252,54 +232,41 @@ class IMUState:
 
     def get(self) -> tuple:
         with self._lock:
-            euler = self.euler
-            gyro = self.gyro
-        return euler, gyro
+            return self.euler, self.gyro
 
 
-def _imu_reader_thread(state: IMUState, cfg: Config,
-                       stop_event: threading.Event):
+def _imu_reader_thread(state: IMUState, cfg: Config):
     """Runs in a daemon thread. Reconnects automatically on serial errors."""
     try:
         with serial.Serial(cfg.IMU_PORT, cfg.IMU_BAUD,
                            timeout=0.05, dsrdtr=False, rtscts=False) as ser:
-            try:
-                time.sleep(1.5)
-                ser.reset_input_buffer()
+            time.sleep(1.5)
+            ser.reset_input_buffer()
 
-                # A previous run may have left the IMU streaming, which can
-                # flood the port and hide the ping ACK on the next startup.
-                _imu_ack(ser, _cmd_imu_stream(False), 0x11, retries=2)
-                time.sleep(0.1); ser.reset_input_buffer()
+            if not _imu_ack(ser, _cmd_ping(), 0x01):
+                print("[IMU] No ping response — check cable and power"); return
 
-                if not _imu_ack(ser, _cmd_ping(), 0x01):
-                    print("[IMU] No ping response — check cable and power"); return
+            _imu_ack(ser, _cmd_imu_stream(False), 0x11)   # stop any old stream
+            time.sleep(0.1); ser.reset_input_buffer()
 
-                if not _imu_ack(ser,
-                                _cmd_imu_format(cfg.IMU_RATE_HZ,
-                                                [FIELD_EULER, FIELD_GYRO]), 0x08):
-                    print("[IMU] Format config failed"); return
+            if not _imu_ack(ser,
+                            _cmd_imu_format(cfg.IMU_RATE_HZ,
+                                            [FIELD_EULER, FIELD_GYRO]), 0x08):
+                print("[IMU] Format config failed"); return
 
-                if not _imu_ack(ser, _cmd_imu_stream(True), 0x11):
-                    print("[IMU] Stream enable failed"); return
+            if not _imu_ack(ser, _cmd_imu_stream(True), 0x11):
+                print("[IMU] Stream enable failed"); return
 
-                print("[IMU] Stream active")
-                while not stop_event.is_set():
-                    r = _read_mip_packet(ser, timeout=0.1)
-                    if r is None:
-                        continue
-                    ds, pl = r
-                    if ds != DESC_IMU:
-                        continue
-                    euler, gyro = _parse_imu_payload(pl)
-                    state.push(euler=euler, gyro=gyro)
-
-            finally:
-                try:
-                    _imu_ack(ser, _cmd_imu_stream(False), 0x11, retries=2)
-                    print("[IMU] Stream stopped")
-                except Exception:
-                    pass
+            print("[IMU] Stream active")
+            while True:
+                r = _read_mip_packet(ser, timeout=0.5)
+                if r is None:
+                    continue
+                ds, pl = r
+                if ds != DESC_IMU:
+                    continue
+                euler, gyro = _parse_imu_payload(pl)
+                state.push(euler=euler, gyro=gyro)
 
     except Exception as exc:
         print(f"[IMU] Thread error: {exc}")
@@ -331,23 +298,27 @@ class PIDTorque:
         self._integral  = 0.0
         self._deriv_lp  = 0.0
 
-    def compute(self, angle: float, rate: float, wheel_vel: float) -> float:
+    def compute(self, angle: float, rate: float, wheel_vel: float,
+                target_angle: float = 0.0) -> float:
         """
-        angle     : tilt angle (rad) — positive means leaning in one direction
-        rate      : angular rate from gyro (rad/s)
-        wheel_vel : wheel/roller encoder velocity (rad/s)
-        Returns   : torque command (Nm) — sign convention: positive torque
-                    opposes positive tilt.
+        angle        : tilt angle (rad) — positive means leaning in one direction
+        rate         : angular rate from gyro (rad/s)
+        wheel_vel    : wheel/roller encoder velocity (rad/s)
+        target_angle : desired lean from outer position loop (rad)
+        Returns      : torque command (Nm) — sign convention: positive torque
+                       opposes positive tilt.
         """
-        error = -angle   # negative: positive tilt → we want negative torque
+        error = target_angle - angle
 
         # Proportional
         p = self.kp * error
 
         # Integral with anti-windup
-        int_limit = self.int_cap / max(self.ki, 1e-9)
-        self._integral = max(-int_limit, min(self._integral + error * self.dt,
-                                             int_limit))
+        self._integral = float(np.clip(
+            self._integral + error * self.dt,
+            -self.int_cap / max(self.ki, 1e-9),
+            +self.int_cap / max(self.ki, 1e-9),
+        ))
         i = self.ki * self._integral
 
         # Derivative from gyro (low-pass filtered)
@@ -374,9 +345,9 @@ class OmBUROPIDController:
     """
     PID torque balancing controller for SrOmBURo.
 
-    Axis and motor direction convention follows control2_Suraj.py:
-        roll  = lateral axis
-        pitch = longitudinal axis
+    Naming follows the paper:
+        roll  = longitudinal axis (forward/backward tilt, θ₁)
+        pitch = lateral axis      (side-to-side tilt,    θ₂)
     """
 
     def __init__(self):
@@ -385,8 +356,6 @@ class OmBUROPIDController:
         self.cfg   = Config()
         self.imu   = IMUState()
         self.robot = Omburo()
-        self._imu_stop = threading.Event()
-        self._imu_thread = None
 
         self.pid_roll  = PIDTorque(
             kp=self.cfg.KP_ROLL,  ki=self.cfg.KI_ROLL,
@@ -399,12 +368,12 @@ class OmBUROPIDController:
             int_cap=self.cfg.INT_CAP_PITCH, dt=self.cfg.CTRL_DT
         )
 
-        # EMA filter states — roll axis (lateral)
+        # EMA filter states — roll axis (longitudinal)
         self._roll_filt      = 0.0
         self._rolldot_filt   = 0.0
         self._vel_roll_filt  = 0.0   # motor id2 velocity
 
-        # EMA filter states — pitch axis (longitudinal)
+        # EMA filter states — pitch axis (lateral)
         self._pitch_filt     = 0.0
         self._pitchdot_filt  = 0.0
         self._vel_pitch_filt = 0.0   # motor id1+id2 velocity
@@ -417,78 +386,33 @@ class OmBUROPIDController:
         self._last_vel_w = 0.0
         self._last_vel_r = 0.0
 
-        # Soft-start state
-        self._command_ramp_t0 = None
-
-        # CSV debug log
-        self._log_file = None
-        self._log_writer = None
-        self._log_path = None
-        if self.cfg.DEBUG_CSV:
-            self._open_debug_csv()
+        # Outer position loop state
+        self.pos_roll         = 0.0
+        self.pos_pitch        = 0.0
+        self.target_pos_roll  = 0.0
+        self.target_pos_pitch = 0.0
+        self.cmd_angle_roll   = 0.0
+        self.cmd_angle_pitch  = 0.0
 
         self._running = False
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
-    def _open_debug_csv(self):
-        """Create a timestamped CSV log for roll command debugging."""
-        log_dir = os.path.dirname(os.path.abspath(__file__))
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        self._log_path = os.path.join(log_dir, f"roll_debug_{timestamp}.csv")
-        self._log_file = open(self._log_path, "w", newline="")
-        self._log_writer = csv.writer(self._log_file)
-        self._log_writer.writerow([
-            "tick",
-            "time_s",
-            "euler_roll_deg",
-            "gyro_roll_rad_s",
-            "roll_offset_deg",
-            "roll_rad",
-            "rolldot_rad_s",
-            "vel_roll_raw_rad_s",
-            "roll_f_rad",
-            "rolldot_f_rad_s",
-            "vel_roll_f_rad_s",
-            "tau_fb_roll_nm",
-            "denom_roll",
-            "tau_ff_roll_g_nm",
-            "tau_ff_roll_f_nm",
-            "tau_ff_roll_nm",
-            "tau_roll_total_nm",
-            "tau_motor1_raw_nm",
-            "tau_motor1_sat_nm",
-            "tau_motor1_ramped_nm",
-            "tau_motor1_final_nm",
-            "tau_motor2_raw_nm",
-            "tau_motor2_sat_nm",
-            "tau_motor2_ramped_nm",
-            "tau_motor2_final_nm",
-            "ramp_scale",
-        ])
-        self._log_file.flush()
-
     def run(self):
         """Start IMU thread, calibrate, then enter 500 Hz control loop."""
         print("=" * 60)
         print("  SrOmBURo PID Torque Controller")
-        print("  Axes: roll=lateral  pitch=longitudinal")
+        print("  Axes: roll=longitudinal(θ₁)  pitch=lateral(θ₂)")
         print("=" * 60)
 
         # Start IMU background thread
-        self._imu_stop.clear()
-        self._imu_thread = threading.Thread(
-            target=_imu_reader_thread,
-            args=(self.imu, self.cfg, self._imu_stop),
-            daemon=True,
-        )
-        self._imu_thread.start()
+        t = threading.Thread(target=_imu_reader_thread,
+                             args=(self.imu, self.cfg), daemon=True)
+        t.start()
 
         print("[Init] Waiting for first IMU packet...")
         if not self.imu.updated.wait(timeout=8.0):
-            print("[ERROR] IMU did not respond in 8 s — check cable")
-            self._stop()
-            return
+            print("[ERROR] IMU did not respond in 8 s — check cable"); return
 
         # Switch to torque/current control mode
         self._set_torque_mode()
@@ -496,15 +420,15 @@ class OmBUROPIDController:
         # Calibrate static offsets
         self._calibrate()
 
-        self._wait_for_space_start()
-
         #Turns on torque for motors
         self.robot.toggleTorque(1)
         time.sleep(0.2)
 
         #Sets motor to torque mode (0)
         self.robot.setTorqueMode()
-        self._command_ramp_t0 = time.perf_counter()
+
+        self.pos_roll  = 0.0
+        self.pos_pitch = 0.0
 
         print(f"\n[Init] Loop rate : {self.cfg.CTRL_HZ} Hz")
         print(f"[Init] KP_ROLL={self.cfg.KP_ROLL}  KD_ROLL={self.cfg.KD_ROLL}  "
@@ -513,44 +437,10 @@ class OmBUROPIDController:
               f"KI_PITCH={self.cfg.KI_PITCH}")
         print(f"[Init] MAX_TORQUE={self.cfg.MAX_TORQUE} Nm  "
               f"FALL_STOP={self.cfg.FALL_DEG}°")
-        print(f"[Init] COMMAND_RAMP={self.cfg.COMMAND_RAMP_SEC:.1f} s")
-        if self._log_path is not None:
-            print(f"[Init] CSV debug log: {self._log_path}")
         print("[Init] Balancing active — Ctrl+C to stop\n")
 
         self._running = True
         self._control_loop()
-
-    def _wait_for_space_start(self):
-        """Block after calibration until SPACE is pressed in the terminal."""
-        print("\n[Init] Calibration complete.")
-        print("[Init] Press SPACE to enable torque and start the 3 s command ramp...")
-
-        if not sys.stdin.isatty():
-            input("[Init] stdin is not a TTY; press Enter to start instead...")
-            return
-
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-        try:
-            tty.setcbreak(fd)
-            while True:
-                ch = sys.stdin.read(1)
-                if ch == " ":
-                    print("[Init] SPACE received — enabling torque.")
-                    return
-                if ch == "\x03":
-                    raise KeyboardInterrupt
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
-    def _command_ramp_scale(self) -> float:
-        """Return 0.0 to 1.0 linear command scale after SPACE start."""
-        if self._command_ramp_t0 is None:
-            return 0.0
-        ramp_sec = max(self.cfg.COMMAND_RAMP_SEC, 1e-9)
-        elapsed = time.perf_counter() - self._command_ramp_t0
-        return max(0.0, min(elapsed / ramp_sec, 1.0))
 
     # ── Hardware helpers ───────────────────────────────────────────────────────
 
@@ -638,7 +528,7 @@ class OmBUROPIDController:
         cfg = self.cfg
         euler, gyro = self.imu.get()
 
-        # ── 1. Sensor → body angles (control2_Suraj.py convention) ──────────
+        # ── 1. Sensor → body angles (paper convention) ──────────────────────
         roll  = (cfg.ROLL_EU_SIGN  * math.radians(euler[cfg.ROLL_EU_IDX])
                  - self._roll_offset)
         pitch = (cfg.PITCH_EU_SIGN * math.radians(euler[cfg.PITCH_EU_IDX])
@@ -660,24 +550,20 @@ class OmBUROPIDController:
         # ── 3. Encoder readback ───────────────────────────────────────────────
         try:
             _, vel_w, _, vel_r = self.robot.readback()
-            if vel_w is None:
-                vel_w = self._last_vel_w
-            else:
-                self._last_vel_w = vel_w
-
-            if vel_r is None:
-                vel_r = self._last_vel_r
-            else:
-                self._last_vel_r = vel_r
+            self._last_vel_w = vel_w
+            self._last_vel_r = vel_r
         except Exception:
             vel_w = self._last_vel_w
             vel_r = self._last_vel_r
 
-        # Motor wiring → axis velocities, matching control2_Suraj.py.
-        #   id1 roller    → roll axis
-        #   id2 big wheel → pitch axis
-        vel_roll_raw  = vel_r
-        vel_pitch_raw = vel_w
+        # Motor wiring → axis velocities (paper §IV):
+        #   roll  axis velocity = motor id2 (wheel)
+        #   pitch axis velocity = motor id2 + motor id1 (roller coupling)
+        vel_roll_raw  = vel_w
+        vel_pitch_raw = vel_w + vel_r
+
+        self.pos_roll  += vel_roll_raw  * cfg.CTRL_DT
+        self.pos_pitch += vel_pitch_raw * cfg.CTRL_DT
 
         # ── 4. EMA low-pass filters ───────────────────────────────────────────
         a_ang  = cfg.EMA_ANG
@@ -698,57 +584,36 @@ class OmBUROPIDController:
         vel_roll_f  = self._vel_roll_filt
         vel_pitch_f = self._vel_pitch_filt
 
-        # ── 5. PID + Feedforward 토크 계산 ───────────────────────────────────────
-        # 5.1 Feedback (PID)
-        tau_fb_roll  = self.pid_roll.compute(roll_f,  rolldot_f,  vel_roll_f)
-        tau_fb_pitch = self.pid_pitch.compute(pitch_f, pitchdot_f, vel_pitch_f)
+        # ── 4b. Outer position loop (50 Hz) ───────────────────────────────────
+        if tick % cfg.OUTER_LOOP_DIVISOR == 0:
+            err_pos_roll  = self.target_pos_roll  - self.pos_roll
+            err_pos_pitch = self.target_pos_pitch - self.pos_pitch
 
-        # 5.2 Dynamic Gravity Feedforward: quasi-static EOM
-        #   m_b L cos(theta) x_ddot - m_b g L sin(theta) = -tau
-        #   M_eff x_ddot = tau / r
-        # => tau_hold = m_b g L sin(theta) / (1 + m_b L cos(theta)/(r M_eff))
-        # Positive tilt needs negative internal torque; roll is inverted later by
-        # tau_roll_total, so this sign follows the existing PID convention.
-        denom_roll = 1.0 + (
-            cfg.M_BODY * cfg.L_COM_ROLL * math.cos(roll_f) /
-            (cfg.R_DRIVE_ROLL * cfg.M_EFF_ROLL)
-        )
-        denom_pitch = 1.0 + (
-            cfg.M_BODY * cfg.L_COM_PITCH * math.cos(pitch_f) /
-            (cfg.R_DRIVE_PITCH * cfg.M_EFF_PITCH)
-        )
-        tau_ff_roll_g = -(cfg.MGL_BODY_ROLL * math.sin(roll_f)) / denom_roll
-        tau_ff_pitch_g = -(cfg.MGL_BODY_PITCH * math.sin(pitch_f)) / denom_pitch
+            self.cmd_angle_roll  = (cfg.KP_POSITION * err_pos_roll
+                                    - cfg.KD_POSITION * vel_roll_f)
+            self.cmd_angle_pitch = (cfg.KP_POSITION * err_pos_pitch
+                                    - cfg.KD_POSITION * vel_pitch_f)
 
-        # 5.3 Friction Feedforward (tanh — sign 대신 연속 함수로 채터링 방지)
-        tau_ff_roll_f  =  -cfg.FRIC_ROLL  * math.tanh(vel_roll_f  * cfg.FRIC_TANH_SCALE)
-        tau_ff_pitch_f =  -cfg.FRIC_PITCH * math.tanh(pitchdot_f * cfg.FRIC_TANH_SCALE)
+        self.cmd_angle_roll  = max(-cfg.MAX_TARGET_ANGLE,
+                                   min(self.cmd_angle_roll,  cfg.MAX_TARGET_ANGLE))
+        self.cmd_angle_pitch = max(-cfg.MAX_TARGET_ANGLE,
+                                   min(self.cmd_angle_pitch, cfg.MAX_TARGET_ANGLE))
 
-        tau_ff_roll  = tau_ff_roll_g  + tau_ff_roll_f
-        tau_ff_pitch = tau_ff_pitch_g + tau_ff_pitch_f
+        # ── 5. PID torque computation ─────────────────────────────────────────
+        tau_roll  = self.pid_roll.compute(roll_f,  rolldot_f,  vel_roll_f,
+                                          target_angle=self.cmd_angle_roll)
+        tau_pitch = -self.pid_pitch.compute(pitch_f, pitchdot_f, vel_pitch_f,
+                                            target_angle=self.cmd_angle_pitch)
 
-        # Total = Feedback + Feedforward.
-        # Roll is inverted to match control2_Suraj.py's positive roll_cmd direction.
-        tau_roll_total  = -(tau_fb_roll  + tau_ff_roll)
-        tau_pitch_total = tau_fb_pitch + tau_ff_pitch
-
-        # ── 6. Motor output, matching control2_Suraj.py ──────────────────────
-        tau_motor2_raw = tau_pitch_total + tau_roll_total/4
-        tau_motor1_raw = tau_roll_total
+        # ── 6. Motor mixing (paper convention) ───────────────────────────────
+        #   motor id2 (wheel)  = roll torque
+        #   motor id1 (roller) = roll torque − pitch torque
+        tau_motor2 = tau_roll + (tau_pitch / 4) # where 8 is the gear ratio N_ROLLER 
+        tau_motor1 = tau_pitch
 
         # Saturate
-        tau_motor2_sat = max(-cfg.MAX_TORQUE,
-                             min(tau_motor2_raw, cfg.MAX_TORQUE))
-        tau_motor1_sat = max(-cfg.MAX_TORQUE,
-                             min(tau_motor1_raw, cfg.MAX_TORQUE))
-
-        # Soft-start: after SPACE, ramp actual motor commands from 0% to 100%.
-        ramp_scale = self._command_ramp_scale()
-        tau_motor2_ramped = tau_motor2_sat * ramp_scale
-        tau_motor1_ramped = tau_motor1_sat * ramp_scale
-
-        tau_motor2 = tau_motor2_ramped
-        tau_motor1 = tau_motor1_ramped
+        tau_motor2 = float(np.clip(tau_motor2, -cfg.MAX_TORQUE, cfg.MAX_TORQUE))
+        tau_motor1 = float(np.clip(tau_motor1, -cfg.MAX_TORQUE, cfg.MAX_TORQUE))
 
         # Below noise floor → send zero (don't waste current on micro-commands)
         if abs(tau_motor2) < cfg.MIN_TORQUE: tau_motor2 = 0.0
@@ -759,70 +624,22 @@ class OmBUROPIDController:
         self.robot.setTorque(tau_motor2, tau_motor1)
         
 
-        # ── 8. Debug print (~1 Hz) ────────────────────────────────────────────
+        # ── 8. Debug print (~10 Hz) ───────────────────────────────────────────
         if tick % cfg.PRINT_EVERY == 0:
-            if self._log_writer is not None:
-                self._log_writer.writerow([
-                    tick,
-                    time.perf_counter(),
-                    euler[cfg.ROLL_EU_IDX],
-                    gyro[cfg.ROLLDOT_IDX],
-                    math.degrees(self._roll_offset),
-                    roll,
-                    rolldot,
-                    vel_roll_raw,
-                    roll_f,
-                    rolldot_f,
-                    vel_roll_f,
-                    tau_fb_roll,
-                    denom_roll,
-                    tau_ff_roll_g,
-                    tau_ff_roll_f,
-                    tau_ff_roll,
-                    tau_roll_total,
-                    tau_motor1_raw,
-                    tau_motor1_sat,
-                    tau_motor1_ramped,
-                    tau_motor1,
-                    tau_motor2_raw,
-                    tau_motor2_sat,
-                    tau_motor2_ramped,
-                    tau_motor2,
-                    ramp_scale,
-                ])
-                self._log_file.flush()
-
             print(
                 f"\n"
-                f"  RAW ROLL    : euler={euler[cfg.ROLL_EU_IDX]:+7.3f}°  "
-                f"gyro={gyro[cfg.ROLLDOT_IDX]:+8.4f} rad/s  "
-                f"offset={math.degrees(self._roll_offset):+7.3f}°\n"
-                f"  ROLL  (lat) : angle={math.degrees(roll_f):+6.2f}°  "
+                f"  ROLL  (long): angle={math.degrees(roll_f):+6.2f}°  "
+                f"cmd={math.degrees(self.cmd_angle_roll):+6.2f}°  "
                 f"rate={math.degrees(rolldot_f):+6.2f}°/s  "
                 f"vel={vel_roll_f:+.3f} rad/s  "
-                f"τ_total={tau_roll_total:+.4f} Nm\n"
-                f"      PID={tau_fb_roll:+.4f}  "
-                f"FF={tau_ff_roll:+.4f} "
-                f"(grav={tau_ff_roll_g:+.4f}, fric={tau_ff_roll_f:+.4f}) Nm  "
-                f"denom={denom_roll:+.4f}\n"
-                f"  PITCH (long): angle={math.degrees(pitch_f):+6.2f}°  "
+                f"τ_roll={tau_roll:+.4f} Nm\n"
+                f"  PITCH (lat) : angle={math.degrees(pitch_f):+6.2f}°  "
+                f"cmd={math.degrees(self.cmd_angle_pitch):+6.2f}°  "
                 f"rate={math.degrees(pitchdot_f):+6.2f}°/s  "
                 f"vel={vel_pitch_f:+.3f} rad/s  "
-                f"τ_total={tau_pitch_total:+.4f} Nm\n"
-                f"      PID={tau_fb_pitch:+.4f}  "
-                f"FF={tau_ff_pitch:+.4f} "
-                f"(grav={tau_ff_pitch_g:+.4f}, fric={tau_ff_pitch_f:+.4f}) Nm\n"
-                f"  ROLL MOTOR  : id1 raw={tau_motor1_raw:+.4f}  "
-                f"sat={tau_motor1_sat:+.4f}  "
-                f"ramped={tau_motor1_ramped:+.4f}  "
-                f"final={tau_motor1:+.4f} Nm\n"
-                f"  WHEEL MIX   : id2 raw={tau_motor2_raw:+.4f}  "
-                f"sat={tau_motor2_sat:+.4f}  "
-                f"ramped={tau_motor2_ramped:+.4f}  "
-                f"final={tau_motor2:+.4f} Nm\n"
+                f"τ_pitch={tau_pitch:+.4f} Nm\n"
                 f"  MOTORS      : id2(wheel)={tau_motor2:+.4f} Nm  "
-                f"id1(roller)={tau_motor1:+.4f} Nm  "
-                f"ramp={ramp_scale * 100.0:5.1f}%",
+                f"id1(roller)={tau_motor1:+.4f} Nm",
                 flush=True
             )
 
@@ -836,17 +653,6 @@ class OmBUROPIDController:
             self.robot.toggleTorque(0)
         except Exception:
             pass
-        self._imu_stop.set()
-        if self._imu_thread is not None and self._imu_thread.is_alive():
-            self._imu_thread.join(timeout=1.0)
-        if self._log_file is not None:
-            try:
-                self._log_file.close()
-                print(f"[Controller] CSV log saved: {self._log_path}")
-            except Exception:
-                pass
-            self._log_file = None
-            self._log_writer = None
         try:
             self.robot.close()
         except Exception:
@@ -860,8 +666,4 @@ class OmBUROPIDController:
 
 if __name__ == "__main__":
     ctrl = OmBUROPIDController()
-    try:
-        ctrl.run()
-    except KeyboardInterrupt:
-        print("\n[Controller] Interrupted during startup...")
-        ctrl._stop()
+    ctrl.run()

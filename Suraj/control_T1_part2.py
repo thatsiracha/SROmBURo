@@ -23,11 +23,10 @@ Tuning order:
     5. Add KV (0.2–1.0) to prevent runaway wheel spin
 """
 
-import csv
 import math
-import os
 import struct
 import sys
+import os
 import termios
 import threading
 import time
@@ -36,7 +35,7 @@ import tty
 import serial
 from pybear import Manager
 
-sys.path.insert(0, "/home/omburo/Documents/SROmBURo")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from Omburo import Omburo
 
 
@@ -68,15 +67,15 @@ class Config:
     PITCHDOT_IDX  = 1;  PITCHDOT_SIGN  = -1.0   # ωy → pitch rate
 
     # ── PID gains — ROLL axis (lateral, side-to-side) ─────────────────────────
-    KP_ROLL  = 0.0   # Nm/rad
-    KI_ROLL  = 0.0   # Nm/(rad·s) — start at 0, add slowly
-    KD_ROLL  = 0.0   # Nm·s/rad   (uses gyro directly, not finite diff)
+    KP_ROLL  = 10.0   # Nm/rad
+    KI_ROLL  = 0.1   # Nm/(rad·s) — start at 0, add slowly
+    KD_ROLL  = 0.1   # Nm·s/rad   (uses gyro directly, not finite diff)
     KV_ROLL  =  0.0   # Nm/(rad/s) — wheel velocity damping
 
     # ── PID gains — PITCH axis (longitudinal, forward/backward) ───────────────
-    KP_PITCH = 0.0
-    KI_PITCH = 0.0
-    KD_PITCH = 0.0
+    KP_PITCH = 10.0
+    KI_PITCH = 0.1
+    KD_PITCH = 0.1
     KV_PITCH =  0.0
 
     # ── Integrator anti-windup ────────────────────────────────────────────────
@@ -85,38 +84,29 @@ class Config:
 
     # ── Safety ────────────────────────────────────────────────────────────────
     FALL_DEG     = 40.0   # cut motors if tilt exceeds this [deg]
-    MAX_TORQUE   = 2.2    # Nm per motor (BEAR limit: 6.3 A × kt 0.35 = 0.525 Nm)
+    MAX_TORQUE   = 2.2    # Nm per motor (BEAR limit: 1.5 A × kt 0.35 = 0.525 Nm)
     MIN_TORQUE   = 0.00   # Nm — below this motors don't move; send 0
 
     # ── EMA low-pass filter coefficients ─────────────────────────────────────
-    # Set to 0.0 to bypass EMA: filtered = raw.
-    EMA_ANG  = 0.0    # angle
-    EMA_RATE = 0.0    # gyro rate
-    EMA_VEL  = 0.0    # wheel velocity
+    # Higher α → more smoothing → more lag. Tune for noise/responsiveness.
+    EMA_ANG  = 0.0   # angle  (~8 Hz cutoff at 500 Hz loop)
+    EMA_RATE = 0.0   # gyro rate
+    EMA_VEL  = 0.1   # wheel velocity (encoder noisier than gyro)
 
     # ── Calibration ───────────────────────────────────────────────────────────
     CALIB_SAMPLES = 100   # IMU samples to average for offset
 
     # ── Feedforward Parameters (Gravity & Friction) ───────────────────────────
-    # Gravity FF uses the above-axis body mass m_b, not total robot mass.
-    M_TOTAL = 3.04       # [kg] total robot mass, reference only
-    G_ACCEL = 9.81       # [m/s²]
-    M_BODY = 2.42        # [kg] above-axis body mass m_b
-    M_WHEEL = 0.620      # [kg] wheel/axis mass m_w
-    L_COM_ROLL = 0.7348  # [m] roll-axis to body COM
-    L_COM_PITCH = 0.647  # [m] pitch-axis to body COM
-    R_ROLL = 0.0142      # [m] roll drive radius
-    R_PITCH = 0.102      # [m] pitch drive radius
-    R_DRIVE_ROLL = R_ROLL / N_ROLLER  # [m] effective roll radius through roller gear
-    R_DRIVE_PITCH = R_PITCH           # [m] pitch direct-drive effective radius
+    # 물리 파라미터 — 실측치로 교체할 것
+    M_TOTAL   = 3.04    # [kg]
+    G_ACCEL   = 9.81   # [m/s²]
+    L_COM     = 0.515   # [m] 무게중심 높이
+    R_WHEEL_ROLL  = 0.015  # [m] roll 축 유효 구동 반지름
+    R_WHEEL_PITCH = 0.1   # [m] pitch 축 유효 구동 반지름
 
-    I_W_ROLL = 0.0       # [kg·m²] roller inertia ignored; TODO: replace if measured
-    I_W_PITCH = 0.0030   # [kg·m²] pitch wheel inertia
-
-    M_EFF_ROLL = M_BODY + M_WHEEL + I_W_ROLL / (R_DRIVE_ROLL**2)
-    M_EFF_PITCH = 3.33   # [kg] = M_BODY + M_WHEEL + I_W_PITCH / R_PITCH²
-    MGL_BODY_ROLL = M_BODY * G_ACCEL * L_COM_ROLL
-    MGL_BODY_PITCH = M_BODY * G_ACCEL * L_COM_PITCH
+    # 중력 토크 (모터 기준): MGL·sin(θ) / (1 + L/r)
+    # leverage = 1 + L/r 로 나눠야 모터 출력 기준 실제값이 됨
+    MGL_TOTAL = M_TOTAL * G_ACCEL * L_COM   # 31.88 Nm (물리량)
 
     # Coulomb Friction
     FRIC_ROLL  = 0.5  # Nm
@@ -127,7 +117,6 @@ class Config:
 
     # ── Debug ─────────────────────────────────────────────────────────────────
     PRINT_EVERY = 50   # print every N control ticks (~1 Hz at 500 Hz)
-    DEBUG_CSV = True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -420,53 +409,9 @@ class OmBUROPIDController:
         # Soft-start state
         self._command_ramp_t0 = None
 
-        # CSV debug log
-        self._log_file = None
-        self._log_writer = None
-        self._log_path = None
-        if self.cfg.DEBUG_CSV:
-            self._open_debug_csv()
-
         self._running = False
 
     # ── Public API ─────────────────────────────────────────────────────────────
-
-    def _open_debug_csv(self):
-        """Create a timestamped CSV log for roll command debugging."""
-        log_dir = os.path.dirname(os.path.abspath(__file__))
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        self._log_path = os.path.join(log_dir, f"roll_debug_{timestamp}.csv")
-        self._log_file = open(self._log_path, "w", newline="")
-        self._log_writer = csv.writer(self._log_file)
-        self._log_writer.writerow([
-            "tick",
-            "time_s",
-            "euler_roll_deg",
-            "gyro_roll_rad_s",
-            "roll_offset_deg",
-            "roll_rad",
-            "rolldot_rad_s",
-            "vel_roll_raw_rad_s",
-            "roll_f_rad",
-            "rolldot_f_rad_s",
-            "vel_roll_f_rad_s",
-            "tau_fb_roll_nm",
-            "denom_roll",
-            "tau_ff_roll_g_nm",
-            "tau_ff_roll_f_nm",
-            "tau_ff_roll_nm",
-            "tau_roll_total_nm",
-            "tau_motor1_raw_nm",
-            "tau_motor1_sat_nm",
-            "tau_motor1_ramped_nm",
-            "tau_motor1_final_nm",
-            "tau_motor2_raw_nm",
-            "tau_motor2_sat_nm",
-            "tau_motor2_ramped_nm",
-            "tau_motor2_final_nm",
-            "ramp_scale",
-        ])
-        self._log_file.flush()
 
     def run(self):
         """Start IMU thread, calibrate, then enter 500 Hz control loop."""
@@ -514,8 +459,6 @@ class OmBUROPIDController:
         print(f"[Init] MAX_TORQUE={self.cfg.MAX_TORQUE} Nm  "
               f"FALL_STOP={self.cfg.FALL_DEG}°")
         print(f"[Init] COMMAND_RAMP={self.cfg.COMMAND_RAMP_SEC:.1f} s")
-        if self._log_path is not None:
-            print(f"[Init] CSV debug log: {self._log_path}")
         print("[Init] Balancing active — Ctrl+C to stop\n")
 
         self._running = True
@@ -703,25 +646,14 @@ class OmBUROPIDController:
         tau_fb_roll  = self.pid_roll.compute(roll_f,  rolldot_f,  vel_roll_f)
         tau_fb_pitch = self.pid_pitch.compute(pitch_f, pitchdot_f, vel_pitch_f)
 
-        # 5.2 Dynamic Gravity Feedforward: quasi-static EOM
-        #   m_b L cos(theta) x_ddot - m_b g L sin(theta) = -tau
-        #   M_eff x_ddot = tau / r
-        # => tau_hold = m_b g L sin(theta) / (1 + m_b L cos(theta)/(r M_eff))
-        # Positive tilt needs negative internal torque; roll is inverted later by
-        # tau_roll_total, so this sign follows the existing PID convention.
-        denom_roll = 1.0 + (
-            cfg.M_BODY * cfg.L_COM_ROLL * math.cos(roll_f) /
-            (cfg.R_DRIVE_ROLL * cfg.M_EFF_ROLL)
-        )
-        denom_pitch = 1.0 + (
-            cfg.M_BODY * cfg.L_COM_PITCH * math.cos(pitch_f) /
-            (cfg.R_DRIVE_PITCH * cfg.M_EFF_PITCH)
-        )
-        tau_ff_roll_g = -(cfg.MGL_BODY_ROLL * math.sin(roll_f)) / denom_roll
-        tau_ff_pitch_g = -(cfg.MGL_BODY_PITCH * math.sin(pitch_f)) / denom_pitch
+        # 5.2 Dynamic Gravity Feedforward: cos 성분을 실시간 반영
+        denom_roll  = 1.0 + (cfg.L_COM * math.cos(roll_f) / cfg.R_WHEEL_ROLL)
+        denom_pitch = 1.0 + (cfg.L_COM * math.cos(pitch_f) / cfg.R_WHEEL_PITCH)
+        tau_ff_roll_g  = -(cfg.MGL_TOTAL * math.sin(roll_f))  / denom_roll
+        tau_ff_pitch_g = -(cfg.MGL_TOTAL * math.sin(pitch_f)) / denom_pitch
 
         # 5.3 Friction Feedforward (tanh — sign 대신 연속 함수로 채터링 방지)
-        tau_ff_roll_f  =  -cfg.FRIC_ROLL  * math.tanh(vel_roll_f  * cfg.FRIC_TANH_SCALE)
+        tau_ff_roll_f  =  -cfg.FRIC_ROLL  * math.tanh(rolldot_f  * cfg.FRIC_TANH_SCALE)
         tau_ff_pitch_f =  -cfg.FRIC_PITCH * math.tanh(pitchdot_f * cfg.FRIC_TANH_SCALE)
 
         tau_ff_roll  = tau_ff_roll_g  + tau_ff_roll_f
@@ -733,22 +665,17 @@ class OmBUROPIDController:
         tau_pitch_total = tau_fb_pitch + tau_ff_pitch
 
         # ── 6. Motor output, matching control2_Suraj.py ──────────────────────
-        tau_motor2_raw = tau_pitch_total + tau_roll_total/4
-        tau_motor1_raw = tau_roll_total
+        tau_motor2 = tau_pitch_total + tau_roll_total/4
+        tau_motor1 = tau_roll_total
 
         # Saturate
-        tau_motor2_sat = max(-cfg.MAX_TORQUE,
-                             min(tau_motor2_raw, cfg.MAX_TORQUE))
-        tau_motor1_sat = max(-cfg.MAX_TORQUE,
-                             min(tau_motor1_raw, cfg.MAX_TORQUE))
+        tau_motor2 = max(-cfg.MAX_TORQUE, min(tau_motor2, cfg.MAX_TORQUE))
+        tau_motor1 = max(-cfg.MAX_TORQUE, min(tau_motor1, cfg.MAX_TORQUE))
 
         # Soft-start: after SPACE, ramp actual motor commands from 0% to 100%.
         ramp_scale = self._command_ramp_scale()
-        tau_motor2_ramped = tau_motor2_sat * ramp_scale
-        tau_motor1_ramped = tau_motor1_sat * ramp_scale
-
-        tau_motor2 = tau_motor2_ramped
-        tau_motor1 = tau_motor1_ramped
+        tau_motor2 *= ramp_scale
+        tau_motor1 *= ramp_scale
 
         # Below noise floor → send zero (don't waste current on micro-commands)
         if abs(tau_motor2) < cfg.MIN_TORQUE: tau_motor2 = 0.0
@@ -761,50 +688,15 @@ class OmBUROPIDController:
 
         # ── 8. Debug print (~1 Hz) ────────────────────────────────────────────
         if tick % cfg.PRINT_EVERY == 0:
-            if self._log_writer is not None:
-                self._log_writer.writerow([
-                    tick,
-                    time.perf_counter(),
-                    euler[cfg.ROLL_EU_IDX],
-                    gyro[cfg.ROLLDOT_IDX],
-                    math.degrees(self._roll_offset),
-                    roll,
-                    rolldot,
-                    vel_roll_raw,
-                    roll_f,
-                    rolldot_f,
-                    vel_roll_f,
-                    tau_fb_roll,
-                    denom_roll,
-                    tau_ff_roll_g,
-                    tau_ff_roll_f,
-                    tau_ff_roll,
-                    tau_roll_total,
-                    tau_motor1_raw,
-                    tau_motor1_sat,
-                    tau_motor1_ramped,
-                    tau_motor1,
-                    tau_motor2_raw,
-                    tau_motor2_sat,
-                    tau_motor2_ramped,
-                    tau_motor2,
-                    ramp_scale,
-                ])
-                self._log_file.flush()
-
             print(
                 f"\n"
-                f"  RAW ROLL    : euler={euler[cfg.ROLL_EU_IDX]:+7.3f}°  "
-                f"gyro={gyro[cfg.ROLLDOT_IDX]:+8.4f} rad/s  "
-                f"offset={math.degrees(self._roll_offset):+7.3f}°\n"
                 f"  ROLL  (lat) : angle={math.degrees(roll_f):+6.2f}°  "
                 f"rate={math.degrees(rolldot_f):+6.2f}°/s  "
                 f"vel={vel_roll_f:+.3f} rad/s  "
                 f"τ_total={tau_roll_total:+.4f} Nm\n"
                 f"      PID={tau_fb_roll:+.4f}  "
                 f"FF={tau_ff_roll:+.4f} "
-                f"(grav={tau_ff_roll_g:+.4f}, fric={tau_ff_roll_f:+.4f}) Nm  "
-                f"denom={denom_roll:+.4f}\n"
+                f"(grav={tau_ff_roll_g:+.4f}, fric={tau_ff_roll_f:+.4f}) Nm\n"
                 f"  PITCH (long): angle={math.degrees(pitch_f):+6.2f}°  "
                 f"rate={math.degrees(pitchdot_f):+6.2f}°/s  "
                 f"vel={vel_pitch_f:+.3f} rad/s  "
@@ -812,14 +704,6 @@ class OmBUROPIDController:
                 f"      PID={tau_fb_pitch:+.4f}  "
                 f"FF={tau_ff_pitch:+.4f} "
                 f"(grav={tau_ff_pitch_g:+.4f}, fric={tau_ff_pitch_f:+.4f}) Nm\n"
-                f"  ROLL MOTOR  : id1 raw={tau_motor1_raw:+.4f}  "
-                f"sat={tau_motor1_sat:+.4f}  "
-                f"ramped={tau_motor1_ramped:+.4f}  "
-                f"final={tau_motor1:+.4f} Nm\n"
-                f"  WHEEL MIX   : id2 raw={tau_motor2_raw:+.4f}  "
-                f"sat={tau_motor2_sat:+.4f}  "
-                f"ramped={tau_motor2_ramped:+.4f}  "
-                f"final={tau_motor2:+.4f} Nm\n"
                 f"  MOTORS      : id2(wheel)={tau_motor2:+.4f} Nm  "
                 f"id1(roller)={tau_motor1:+.4f} Nm  "
                 f"ramp={ramp_scale * 100.0:5.1f}%",
@@ -839,14 +723,6 @@ class OmBUROPIDController:
         self._imu_stop.set()
         if self._imu_thread is not None and self._imu_thread.is_alive():
             self._imu_thread.join(timeout=1.0)
-        if self._log_file is not None:
-            try:
-                self._log_file.close()
-                print(f"[Controller] CSV log saved: {self._log_path}")
-            except Exception:
-                pass
-            self._log_file = None
-            self._log_writer = None
         try:
             self.robot.close()
         except Exception:

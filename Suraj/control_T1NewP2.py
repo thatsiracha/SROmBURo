@@ -6,8 +6,8 @@ Axis and motor direction convention follows control2_Suraj.py:
     roll  — lateral tilt,      euler[0], sign +1
     pitch — longitudinal tilt, euler[1], sign -1
 
-Control law per axis:
-    error    = 0 − angle                          (want upright = 0 rad)
+Control law per axis (500 Hz):
+    error    = −angle
     integral += error · dt                        (anti-windup clamped)
     torque   = Kp·error + Ki·integral + Kd·rate + Kv·wheel_velocity
 
@@ -91,7 +91,7 @@ class Config:
     # Higher α → more smoothing → more lag. Tune for noise/responsiveness.
     EMA_ANG  = 0.0   # angle  (~8 Hz cutoff at 500 Hz loop)
     EMA_RATE = 0.0   # gyro rate
-    EMA_VEL  = 0.0   # wheel velocity (encoder noisier than gyro)
+    EMA_VEL  = 0.15  # wheel velocity (encoder noisier than gyro)
 
     # ── Calibration ───────────────────────────────────────────────────────────
     CALIB_SAMPLES = 100   # IMU samples to average for offset
@@ -109,7 +109,7 @@ class Config:
     MGL_TOTAL = M_TOTAL * G_ACCEL * L_COM   # 31.88 Nm (물리량)
 
     # Coulomb Friction
-    FRIC_ROLL  = 0.5  # Nm
+    FRIC_ROLL  = 0.7  # Nm
     FRIC_PITCH = 0.3  # Nm
 
     # tanh 마찰 보상 스케일 (클수록 sign에 가까움, 작을수록 부드러움)
@@ -320,15 +320,17 @@ class PIDTorque:
         self._integral  = 0.0
         self._deriv_lp  = 0.0
 
-    def compute(self, angle: float, rate: float, wheel_vel: float) -> float:
+    def compute(self, angle: float, rate: float, wheel_vel: float,
+                target_angle: float = 0.0) -> float:
         """
-        angle     : tilt angle (rad) — positive means leaning in one direction
-        rate      : angular rate from gyro (rad/s)
-        wheel_vel : wheel/roller encoder velocity (rad/s)
-        Returns   : torque command (Nm) — sign convention: positive torque
-                    opposes positive tilt.
+        angle        : tilt angle (rad) — positive means leaning in one direction
+        rate         : angular rate from gyro (rad/s)
+        wheel_vel    : wheel/roller encoder velocity (rad/s)
+        target_angle : desired lean angle (rad), default 0
+        Returns      : torque command (Nm) — sign convention: positive torque
+                       opposes positive tilt.
         """
-        error = -angle   # negative: positive tilt → we want negative torque
+        error = target_angle - angle
 
         # Proportional
         p = self.kp * error
@@ -652,7 +654,7 @@ class OmBUROPIDController:
         tau_ff_roll_g  = -(cfg.MGL_TOTAL * math.sin(roll_f))  / denom_roll
         tau_ff_pitch_g = -(cfg.MGL_TOTAL * math.sin(pitch_f)) / denom_pitch
 
-        # 5.3 Friction Feedforward (tanh — sign 대신 연속 함수로 채터링 방지)
+        # 5.3 Friction Feedforward (tanh — opposes wheel motion, not body tilt)
         tau_ff_roll_f  =  -cfg.FRIC_ROLL  * math.tanh(rolldot_f  * cfg.FRIC_TANH_SCALE)
         tau_ff_pitch_f =  -cfg.FRIC_PITCH * math.tanh(pitchdot_f * cfg.FRIC_TANH_SCALE)
 

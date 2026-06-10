@@ -91,9 +91,9 @@ class Config:
 
     # ── EMA low-pass filter coefficients ─────────────────────────────────────
     # Higher α → more smoothing → more lag. Tune for noise/responsiveness.
-    EMA_ANG  = 0.20   # angle  (~8 Hz cutoff at 500 Hz loop)
-    EMA_RATE = 0.35   # gyro rate
-    EMA_VEL  = 0.60   # wheel velocity (encoder noisier than gyro)
+    EMA_ANG  = 0.0   # angle  (~8 Hz cutoff at 500 Hz loop)
+    EMA_RATE = 0.0   # gyro rate
+    EMA_VEL  = 0.150   # wheel velocity (encoder noisier than gyro)
 
     # ── Calibration ───────────────────────────────────────────────────────────
     CALIB_SAMPLES = 100   # IMU samples to average for offset
@@ -568,7 +568,7 @@ class OmBUROPIDController:
         #   motor id2 (wheel)  = roll torque
         #   motor id1 (roller) = roll torque − pitch torque
         tau_motor2 = tau_roll + (tau_pitch / 4) # where 8 is the gear ratio N_ROLLER 
-        tau_motor1 = 0
+        tau_motor1 = tau_pitch
 
         # Saturate
         tau_motor2 = float(np.clip(tau_motor2, -cfg.MAX_TORQUE, cfg.MAX_TORQUE))

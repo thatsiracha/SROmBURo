@@ -24,6 +24,7 @@ Tuning order:
 """
 
 import csv
+import html
 import math
 import os
 import struct
@@ -68,15 +69,15 @@ class Config:
     PITCHDOT_IDX  = 1;  PITCHDOT_SIGN  = -1.0   # ωy → pitch rate
 
     # ── PID gains — ROLL axis (lateral, side-to-side) ─────────────────────────
-    KP_ROLL  = 0.0   # Nm/rad
-    KI_ROLL  = 0.0   # Nm/(rad·s) — start at 0, add slowly
-    KD_ROLL  = 0.0   # Nm·s/rad   (uses gyro directly, not finite diff)
+    KP_ROLL  = 15.0   # Nm/rad
+    KI_ROLL  = 0.5   # Nm/(rad·s) — start at 0, add slowly
+    KD_ROLL  = 2.0   # Nm·s/rad   (uses gyro directly, not finite diff)
     KV_ROLL  =  0.0   # Nm/(rad/s) — wheel velocity damping
 
     # ── PID gains — PITCH axis (longitudinal, forward/backward) ───────────────
-    KP_PITCH = 0.0
-    KI_PITCH = 0.0
-    KD_PITCH = 0.0
+    KP_PITCH = 15.0
+    KI_PITCH = 0.5
+    KD_PITCH = 2.0
     KV_PITCH =  0.0
 
     # ── Integrator anti-windup ────────────────────────────────────────────────
@@ -85,7 +86,7 @@ class Config:
 
     # ── Safety ────────────────────────────────────────────────────────────────
     FALL_DEG     = 40.0   # cut motors if tilt exceeds this [deg]
-    MAX_TORQUE   = 2.2    # Nm per motor (BEAR limit: 6.3 A × kt 0.35 = 0.525 Nm)
+    MAX_TORQUE   = 6    # Nm per motor (BEAR limit: 6.3 A × kt 0.35 = 0.525 Nm)
     MIN_TORQUE   = 0.00   # Nm — below this motors don't move; send 0
 
     # ── EMA low-pass filter coefficients ─────────────────────────────────────
@@ -424,6 +425,8 @@ class OmBUROPIDController:
         self._log_file = None
         self._log_writer = None
         self._log_path = None
+        self._run_dir = None
+        self._log_t0 = None
         if self.cfg.DEBUG_CSV:
             self._open_debug_csv()
 
@@ -432,30 +435,50 @@ class OmBUROPIDController:
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def _open_debug_csv(self):
-        """Create a timestamped CSV log for roll command debugging."""
-        log_dir = os.path.dirname(os.path.abspath(__file__))
+        """Create a timestamped run folder and CSV log."""
+        base_dir = os.path.dirname(os.path.abspath(__file__))
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        self._log_path = os.path.join(log_dir, f"roll_debug_{timestamp}.csv")
+        self._run_dir = os.path.join(base_dir, timestamp)
+        os.makedirs(self._run_dir, exist_ok=True)
+        self._log_path = os.path.join(self._run_dir, f"control_debug_{timestamp}.csv")
+        self._log_t0 = time.perf_counter()
         self._log_file = open(self._log_path, "w", newline="")
         self._log_writer = csv.writer(self._log_file)
         self._log_writer.writerow([
             "tick",
             "time_s",
             "euler_roll_deg",
+            "euler_pitch_deg",
             "gyro_roll_rad_s",
+            "gyro_pitch_rad_s",
             "roll_offset_deg",
+            "pitch_offset_deg",
             "roll_rad",
+            "pitch_rad",
             "rolldot_rad_s",
+            "pitchdot_rad_s",
             "vel_roll_raw_rad_s",
+            "vel_pitch_raw_rad_s",
             "roll_f_rad",
+            "pitch_f_rad",
+            "roll_f_deg",
+            "pitch_f_deg",
             "rolldot_f_rad_s",
+            "pitchdot_f_rad_s",
             "vel_roll_f_rad_s",
+            "vel_pitch_f_rad_s",
             "tau_fb_roll_nm",
+            "tau_fb_pitch_nm",
             "denom_roll",
+            "denom_pitch",
             "tau_ff_roll_g_nm",
+            "tau_ff_pitch_g_nm",
             "tau_ff_roll_f_nm",
+            "tau_ff_pitch_f_nm",
             "tau_ff_roll_nm",
+            "tau_ff_pitch_nm",
             "tau_roll_total_nm",
+            "tau_pitch_total_nm",
             "tau_motor1_raw_nm",
             "tau_motor1_sat_nm",
             "tau_motor1_ramped_nm",
@@ -467,6 +490,250 @@ class OmBUROPIDController:
             "ramp_scale",
         ])
         self._log_file.flush()
+
+    def _plot_debug_csv(self):
+        """Generate SVG plots for the run CSV using only the standard library."""
+        if self._log_path is None or self._run_dir is None:
+            return
+        try:
+            with open(self._log_path, newline="") as fh:
+                rows = list(csv.DictReader(fh))
+        except Exception as exc:
+            print(f"[Controller] Plot generation failed: {exc}")
+            return
+
+        if not rows:
+            print("[Controller] Plot generation skipped: CSV has no data rows")
+            return
+
+        plot_specs = [
+            ("01_time_roll_angle.svg", "time - roll angle", "roll_f_deg", "Roll angle [deg]"),
+            ("02_time_pitch_angle.svg", "time - pitch angle", "pitch_f_deg", "Pitch angle [deg]"),
+            ("03_time_feed_forward_roll.svg", "time - feed forward command (roll)", "tau_ff_roll_nm", "Feed forward roll [Nm]"),
+            ("04_time_feed_forward_pitch.svg", "time - feed forward command (pitch)", "tau_ff_pitch_nm", "Feed forward pitch [Nm]"),
+            ("05_time_pid_roll.svg", "time - PID (roll)", "tau_fb_roll_nm", "PID roll [Nm]"),
+            ("06_time_pid_pitch.svg", "time - PID (pitch)", "tau_fb_pitch_nm", "PID pitch [Nm]"),
+            ("07_time_friction_roll.svg", "time - friction (roll)", "tau_ff_roll_f_nm", "Friction roll [Nm]"),
+            ("08_time_friction_pitch.svg", "time - friction (pitch)", "tau_ff_pitch_f_nm", "Friction pitch [Nm]"),
+            ("09_time_total_roll.svg", "time - total (roll)", "tau_roll_total_nm", "Total roll [Nm]"),
+            ("10_time_total_pitch.svg", "time - total (pitch)", "tau_pitch_total_nm", "Total pitch [Nm]"),
+        ]
+
+        saved = 0
+        for filename, title, y_key, y_label in plot_specs:
+            points = []
+            for row in rows:
+                try:
+                    x = float(row["time_s"])
+                    y = float(row[y_key])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if math.isfinite(x) and math.isfinite(y):
+                    points.append((x, y))
+            if not points:
+                continue
+            self._write_svg_plot(
+                path=os.path.join(self._run_dir, filename),
+                title=title,
+                points=points,
+                x_label="Time [s]",
+                y_label=y_label,
+            )
+            saved += 1
+
+        self._write_svg_dashboard(
+            path=os.path.join(self._run_dir, "11_all_plots.svg"),
+            title="SrOmBURo control debug summary",
+            rows=rows,
+            plot_specs=plot_specs,
+        )
+        saved += 1
+
+        print(f"[Controller] Plot files saved: {self._run_dir} ({saved} SVG)")
+
+    @staticmethod
+    def _points_from_rows(rows, y_key):
+        points = []
+        for row in rows:
+            try:
+                x = float(row["time_s"])
+                y = float(row[y_key])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(x) and math.isfinite(y):
+                points.append((x, y))
+        return points
+
+    @staticmethod
+    def _write_svg_plot(path, title, points, x_label, y_label):
+        width, height = 1000, 520
+        left, right, top, bottom = 90, 30, 55, 70
+        plot_w = width - left - right
+        plot_h = height - top - bottom
+
+        if len(points) > 2000:
+            step = math.ceil(len(points) / 2000)
+            points = points[::step]
+
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+        if x_min == x_max:
+            x_min -= 0.5
+            x_max += 0.5
+        if y_min == y_max:
+            pad = max(abs(y_min) * 0.05, 1.0)
+            y_min -= pad
+            y_max += pad
+        else:
+            pad = (y_max - y_min) * 0.08
+            y_min -= pad
+            y_max += pad
+
+        def sx(x):
+            return left + (x - x_min) / (x_max - x_min) * plot_w
+
+        def sy(y):
+            return top + (y_max - y) / (y_max - y_min) * plot_h
+
+        polyline = " ".join(f"{sx(x):.2f},{sy(y):.2f}" for x, y in points)
+        h_title = html.escape(title)
+        h_x_label = html.escape(x_label)
+        h_y_label = html.escape(y_label)
+
+        grid_lines = []
+        tick_labels = []
+        for i in range(6):
+            gx = left + plot_w * i / 5
+            x_val = x_min + (x_max - x_min) * i / 5
+            grid_lines.append(
+                f'<line x1="{gx:.2f}" y1="{top}" x2="{gx:.2f}" y2="{top + plot_h}" stroke="#eeeeee"/>'
+            )
+            tick_labels.append(
+                f'<text x="{gx:.2f}" y="{top + plot_h + 24}" font-size="12" text-anchor="middle">{x_val:.2f}</text>'
+            )
+        for i in range(6):
+            gy = top + plot_h * i / 5
+            y_val = y_max - (y_max - y_min) * i / 5
+            grid_lines.append(
+                f'<line x1="{left}" y1="{gy:.2f}" x2="{left + plot_w}" y2="{gy:.2f}" stroke="#eeeeee"/>'
+            )
+            tick_labels.append(
+                f'<text x="{left - 12}" y="{gy + 4:.2f}" font-size="12" text-anchor="end">{y_val:.3g}</text>'
+            )
+
+        svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+<rect width="100%" height="100%" fill="white"/>
+<text x="{width / 2}" y="28" font-size="22" font-family="Arial, sans-serif" text-anchor="middle">{h_title}</text>
+<g font-family="Arial, sans-serif" fill="#222">
+{''.join(grid_lines)}
+<line x1="{left}" y1="{top + plot_h}" x2="{left + plot_w}" y2="{top + plot_h}" stroke="#333" stroke-width="1.5"/>
+<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_h}" stroke="#333" stroke-width="1.5"/>
+<polyline fill="none" stroke="#1f77b4" stroke-width="2" points="{polyline}"/>
+{''.join(tick_labels)}
+<text x="{left + plot_w / 2}" y="{height - 22}" font-size="14" text-anchor="middle">{h_x_label}</text>
+<text transform="translate(24 {top + plot_h / 2}) rotate(-90)" font-size="14" text-anchor="middle">{h_y_label}</text>
+</g>
+</svg>
+'''
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(svg)
+
+    @staticmethod
+    def _write_svg_dashboard(path, title, rows, plot_specs):
+        width, height = 1600, 1800
+        margin_x, margin_top, margin_bottom = 80, 70, 55
+        gap_x, gap_y = 70, 58
+        cols, rows_n = 2, 5
+        panel_w = (width - 2 * margin_x - gap_x) / cols
+        panel_h = (height - margin_top - margin_bottom - gap_y * (rows_n - 1)) / rows_n
+
+        panels = []
+        for idx, (_, panel_title, y_key, y_label) in enumerate(plot_specs):
+            points = OmBUROPIDController._points_from_rows(rows, y_key)
+            if not points:
+                continue
+            if len(points) > 1000:
+                step = math.ceil(len(points) / 1000)
+                points = points[::step]
+
+            col = idx % cols
+            row = idx // cols
+            x0 = margin_x + col * (panel_w + gap_x)
+            y0 = margin_top + row * (panel_h + gap_y)
+            left, right, top, bottom = 58, 12, 26, 38
+            plot_x0 = x0 + left
+            plot_y0 = y0 + top
+            plot_w = panel_w - left - right
+            plot_h = panel_h - top - bottom
+
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            x_min, x_max = min(xs), max(xs)
+            y_min, y_max = min(ys), max(ys)
+            if x_min == x_max:
+                x_min -= 0.5
+                x_max += 0.5
+            if y_min == y_max:
+                pad = max(abs(y_min) * 0.05, 1.0)
+                y_min -= pad
+                y_max += pad
+            else:
+                pad = (y_max - y_min) * 0.08
+                y_min -= pad
+                y_max += pad
+
+            def sx(x):
+                return plot_x0 + (x - x_min) / (x_max - x_min) * plot_w
+
+            def sy(y):
+                return plot_y0 + (y_max - y) / (y_max - y_min) * plot_h
+
+            grid = []
+            labels = []
+            for i in range(4):
+                gx = plot_x0 + plot_w * i / 3
+                x_val = x_min + (x_max - x_min) * i / 3
+                grid.append(
+                    f'<line x1="{gx:.2f}" y1="{plot_y0:.2f}" x2="{gx:.2f}" y2="{plot_y0 + plot_h:.2f}" stroke="#eeeeee"/>'
+                )
+                labels.append(
+                    f'<text x="{gx:.2f}" y="{plot_y0 + plot_h + 18:.2f}" font-size="10" text-anchor="middle">{x_val:.1f}</text>'
+                )
+            for i in range(4):
+                gy = plot_y0 + plot_h * i / 3
+                y_val = y_max - (y_max - y_min) * i / 3
+                grid.append(
+                    f'<line x1="{plot_x0:.2f}" y1="{gy:.2f}" x2="{plot_x0 + plot_w:.2f}" y2="{gy:.2f}" stroke="#eeeeee"/>'
+                )
+                labels.append(
+                    f'<text x="{plot_x0 - 8:.2f}" y="{gy + 3:.2f}" font-size="10" text-anchor="end">{y_val:.2g}</text>'
+                )
+
+            polyline = " ".join(f"{sx(x):.2f},{sy(y):.2f}" for x, y in points)
+            panels.append(f'''
+<g transform="translate(0 0)">
+<text x="{x0 + panel_w / 2:.2f}" y="{y0 + 15:.2f}" font-size="15" text-anchor="middle">{html.escape(panel_title)}</text>
+{''.join(grid)}
+<line x1="{plot_x0:.2f}" y1="{plot_y0 + plot_h:.2f}" x2="{plot_x0 + plot_w:.2f}" y2="{plot_y0 + plot_h:.2f}" stroke="#333" stroke-width="1"/>
+<line x1="{plot_x0:.2f}" y1="{plot_y0:.2f}" x2="{plot_x0:.2f}" y2="{plot_y0 + plot_h:.2f}" stroke="#333" stroke-width="1"/>
+<polyline fill="none" stroke="#1f77b4" stroke-width="1.7" points="{polyline}"/>
+{''.join(labels)}
+<text x="{plot_x0 + plot_w / 2:.2f}" y="{y0 + panel_h - 5:.2f}" font-size="11" text-anchor="middle">Time [s]</text>
+<text transform="translate({x0 + 13:.2f} {plot_y0 + plot_h / 2:.2f}) rotate(-90)" font-size="11" text-anchor="middle">{html.escape(y_label)}</text>
+</g>''')
+
+        svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+<rect width="100%" height="100%" fill="white"/>
+<g font-family="Arial, sans-serif" fill="#222">
+<text x="{width / 2}" y="36" font-size="28" text-anchor="middle">{html.escape(title)}</text>
+{''.join(panels)}
+</g>
+</svg>
+'''
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(svg)
 
     def run(self):
         """Start IMU thread, calibrate, then enter 500 Hz control loop."""
@@ -764,22 +1031,39 @@ class OmBUROPIDController:
             if self._log_writer is not None:
                 self._log_writer.writerow([
                     tick,
-                    time.perf_counter(),
+                    time.perf_counter() - self._log_t0,
                     euler[cfg.ROLL_EU_IDX],
+                    euler[cfg.PITCH_EU_IDX],
                     gyro[cfg.ROLLDOT_IDX],
+                    gyro[cfg.PITCHDOT_IDX],
                     math.degrees(self._roll_offset),
+                    math.degrees(self._pitch_offset),
                     roll,
+                    pitch,
                     rolldot,
+                    pitchdot,
                     vel_roll_raw,
+                    vel_pitch_raw,
                     roll_f,
+                    pitch_f,
+                    math.degrees(roll_f),
+                    math.degrees(pitch_f),
                     rolldot_f,
+                    pitchdot_f,
                     vel_roll_f,
+                    vel_pitch_f,
                     tau_fb_roll,
+                    tau_fb_pitch,
                     denom_roll,
+                    denom_pitch,
                     tau_ff_roll_g,
+                    tau_ff_pitch_g,
                     tau_ff_roll_f,
+                    tau_ff_pitch_f,
                     tau_ff_roll,
+                    tau_ff_pitch,
                     tau_roll_total,
+                    tau_pitch_total,
                     tau_motor1_raw,
                     tau_motor1_sat,
                     tau_motor1_ramped,
@@ -843,6 +1127,7 @@ class OmBUROPIDController:
             try:
                 self._log_file.close()
                 print(f"[Controller] CSV log saved: {self._log_path}")
+                self._plot_debug_csv()
             except Exception:
                 pass
             self._log_file = None

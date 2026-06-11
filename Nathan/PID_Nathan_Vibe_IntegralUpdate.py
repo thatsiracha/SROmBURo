@@ -39,7 +39,7 @@ from pybear import Manager
 sys.path.insert(0, "/home/omburo/Documents/SROmBURo")
 from Omburo import Omburo
 
-
+#from csvWriter import csvWriter
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION
@@ -70,23 +70,24 @@ class Config:
 
     # ── PID gains — ROLL axis (longitudinal, forward/backward) ───────────────
     KP_ROLL  =  35.0   # Nm/rad
-    KI_ROLL  =  0.13   # Nm/(rad·s) — start at 0, add slowly
+    KI_ROLL  =  0.1    # Nm/(rad·s) — start at 0, add slowly
     KD_ROLL  =  2.5   # Nm·s/rad   (uses gyro directly, not finite diff)
     KV_ROLL  =  0.0   # Nm/(rad/s) — wheel velocity damping
 
     # ── PID gains — PITCH axis (lateral, side-to-side) ───────────────────────
     KP_PITCH =  35.0
-    KI_PITCH =  0.1
+    KI_PITCH =  0.2 
     KD_PITCH =  2.5
     KV_PITCH =  0.0
 
     # ── Integrator anti-windup ────────────────────────────────────────────────
-    INT_CAP_ROLL  = 0.3   # Nm — max integral contribution
-    INT_CAP_PITCH = 0.3
+    INT_CAP_ROLL  = 0.5  # Nm — max integral contribution
+    INT_CAP_PITCH = 0.5
+    INT_RESET_DEG = 0.1   # deg — reset integral if angle error is within this band
 
     # ── Safety ────────────────────────────────────────────────────────────────
     FALL_DEG     = 40.0   # cut motors if tilt exceeds this [deg]
-    MAX_TORQUE   = 2.5    # Nm per motor (BEAR limit: 1.5 A × kt 0.35 = 0.525 Nm)
+    MAX_TORQUE   = 2.0    # Nm per motor (BEAR limit: 1.5 A × kt 0.35 = 0.525 Nm)
     MIN_TORQUE   = 0.00   # Nm — below this motors don't move; send 0
 
     # ── EMA low-pass filter coefficients ─────────────────────────────────────
@@ -279,13 +280,14 @@ class PIDTorque:
     DERIV_LP_ALPHA = 0.7   # low-pass on derivative output (0 = none, 1 = heavy)
 
     def __init__(self, kp: float, ki: float, kd: float, kv: float,
-                 int_cap: float, dt: float):
+                 int_cap: float, dt: float, int_reset_rad: float):
         self.kp      = kp
         self.ki      = ki
         self.kd      = kd
         self.kv      = kv       # wheel velocity damping gain
         self.int_cap = int_cap
         self.dt      = dt
+        self.int_reset_rad = int_reset_rad   # Store the deadband threshold
 
         self._integral  = 0.0
         self._deriv_lp  = 0.0
@@ -303,12 +305,18 @@ class PIDTorque:
         # Proportional
         p = self.kp * error
 
-        # Integral with anti-windup
-        self._integral = float(np.clip(
-            self._integral + error * self.dt,
-            -self.int_cap / max(self.ki, 1e-9),
-            +self.int_cap / max(self.ki, 1e-9),
-        ))
+        #Integral Reset Deadband
+        # If we are within the target angle tolerance, clear the accumulated integral
+        if abs(error) <= self.int_reset_rad:
+            self._integral = 0.0
+        else:
+            # Integral with anti-windup
+            self._integral = float(np.clip(
+                self._integral + error * self.dt,
+                -self.int_cap / max(self.ki, 1e-9),
+                +self.int_cap / max(self.ki, 1e-9),
+            ))
+
         i = self.ki * self._integral
 
         # Derivative from gyro (low-pass filtered)
@@ -347,15 +355,20 @@ class OmBUROPIDController:
         self.imu   = IMUState()
         self.robot = Omburo()
 
+        # Convert threshold from degrees to radians once during init
+        int_reset_rads = math.radians(self.cfg.INT_RESET_DEG)
+
         self.pid_roll  = PIDTorque(
             kp=self.cfg.KP_ROLL,  ki=self.cfg.KI_ROLL,
             kd=self.cfg.KD_ROLL,  kv=self.cfg.KV_ROLL,
-            int_cap=self.cfg.INT_CAP_ROLL, dt=self.cfg.CTRL_DT
+            int_cap=self.cfg.INT_CAP_ROLL, dt=self.cfg.CTRL_DT,
+            int_reset_rad=int_reset_rads
         )
         self.pid_pitch = PIDTorque(
             kp=self.cfg.KP_PITCH, ki=self.cfg.KI_PITCH,
             kd=self.cfg.KD_PITCH, kv=self.cfg.KV_PITCH,
-            int_cap=self.cfg.INT_CAP_PITCH, dt=self.cfg.CTRL_DT
+            int_cap=self.cfg.INT_CAP_PITCH, dt=self.cfg.CTRL_DT,
+            int_reset_rad=int_reset_rads
         )
 
         # EMA filter states — roll axis (longitudinal)
@@ -395,6 +408,10 @@ class OmBUROPIDController:
         print("[Init] Waiting for first IMU packet...")
         if not self.imu.updated.wait(timeout=8.0):
             print("[ERROR] IMU did not respond in 8 s — check cable"); return
+
+        # Create new CSV file for logging
+        dateTime = time.strftime("%Y%m%d-%H%M%S")
+        self.csv = csvWriter(f"pid_log_{dateTime}.csv")
 
         # Switch to torque/current control mode
         self._set_torque_mode()
@@ -458,7 +475,7 @@ class OmBUROPIDController:
                           math.radians(euler[self.cfg.PITCH_EU_IDX]))
             collected += 1
 
-        self._roll_offset  = roll_sum / n
+        self._roll_offset  = roll_sum  / n
         self._pitch_offset = pitch_sum / n
         self.pid_roll.reset()
         self.pid_pitch.reset()
@@ -600,6 +617,13 @@ class OmBUROPIDController:
                 flush=True
             )
 
+        # log to CSV
+        self.csv.append([
+            tick,
+            roll_f, pitch_f, rolldot_f, pitchdot_f, vel_roll_f, vel_pitch_f,
+            tau_roll, tau_pitch, tau_motor2, tau_motor1
+        ])
+
     # ── Shutdown ───────────────────────────────────────────────────────────────
 
     def _stop(self):
@@ -612,6 +636,10 @@ class OmBUROPIDController:
             pass
         try:
             self.robot.close()
+        except Exception:
+            pass
+        try:
+            self.csv.close()
         except Exception:
             pass
         print("[Controller] Done.")

@@ -71,15 +71,15 @@ class Config:
     PITCHDOT_IDX  = 0;  PITCHDOT_SIGN  =  1.0   # ωx → θ̇₂ (lateral rate)
 
     # ── PID gains — ROLL axis (longitudinal, forward/backward) ───────────────
-    KP_ROLL  =  45.0   # Nm/rad
+    KP_ROLL  =  35.0   # Nm/rad
     KI_ROLL  =  0.05   # Nm/(rad·s) — start at 0, add slowly
-    KD_ROLL  =  2.0   # Nm·s/rad   (uses gyro directly, not finite diff)
+    KD_ROLL  =  2.5   # Nm·s/rad   (uses gyro directly, not finite diff)
     KV_ROLL  =  0.0   # Nm/(rad/s) — wheel velocity damping
 
     # ── PID gains — PITCH axis (lateral, side-to-side) ───────────────────────
-    KP_PITCH =  45.0
+    KP_PITCH =  35.0
     KI_PITCH =  0.05
-    KD_PITCH =  2.0
+    KD_PITCH =  2.5
     KV_PITCH =  0.0
 
     # ── Integrator anti-windup ────────────────────────────────────────────────
@@ -88,7 +88,7 @@ class Config:
 
     # ── Safety ────────────────────────────────────────────────────────────────
     FALL_DEG     = 40.0   # cut motors if tilt exceeds this [deg]
-    MAX_TORQUE   = 2.1    # Nm per motor (BEAR limit: 1.5 A × kt 0.35 = 0.525 Nm)
+    MAX_TORQUE   = 2.5    # Nm per motor (BEAR limit: 1.5 A × kt 0.35 = 0.525 Nm)
     MIN_TORQUE   = 0.00   # Nm — below this motors don't move; send 0
 
     # ── EMA low-pass filter coefficients ─────────────────────────────────────
@@ -99,10 +99,10 @@ class Config:
 
     # ── Outer position loop (500 Hz inner loop) ─────────────────
     OUTER_LOOP_DIVISOR = 1
-    KP_POSITION        = 0.013
+    KP_POSITION        = 0.012
     KD_POSITION        = 0.0
     MAX_TARGET_ANGLE   = 0.05   # rad (~5.7°) — clamp outer-loop lean command
-    MAX_ANGLE_RATE = 0.3  # Max change of 0.25 rad (~14.3 degrees) per second
+    MAX_ANGLE_RATE = 0.25  # Max change of 0.25 rad (~14.3 degrees) per second
 
     # ── Calibration ───────────────────────────────────────────────────────────
     CALIB_SAMPLES = 100   # IMU samples to average for offset

@@ -66,13 +66,13 @@ class Config:
     PITCHDOT_IDX  = 1;  PITCHDOT_SIGN  = -1.0   # ωy → pitch rate
 
     # ── PID gains — ROLL axis (lateral, side-to-side) ─────────────────────────
-    KP_ROLL  = 100.0   # Nm/rad
+    KP_ROLL  = 30.0   # Nm/rad
     KI_ROLL  = 0.1   # Nm/(rad·s) — start at 0, add slowly
-    KD_ROLL  = 5.0   # Nm·s/rad   (uses gyro directly, not finite diff)
+    KD_ROLL  = 3.0   # Nm·s/rad   (uses gyro directly, not finite diff)
     KV_ROLL  =  0.0   # Nm/(rad/s) — wheel velocity damping
 
     # ── PID gains — PITCH axis (longitudinal, forward/backward) ───────────────
-    KP_PITCH = 50.0
+    KP_PITCH = 30.0
     KI_PITCH = 0.1
     KD_PITCH = 3.0
     KV_PITCH =  0.0
